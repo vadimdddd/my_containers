@@ -35,8 +35,6 @@
 Итого: 41 контейнер.
 
 ## Структура репозитория
-## 📁 Структура проекта
-
 ```
 ├── my_detectors/
 │   ├── yolov9_docker.dockerfile
@@ -102,8 +100,9 @@
 │
 └── README.md                # этот файл
 ```
-Что в каждой папке
-📦 my_detectors — детекция объектов
+
+## Что в каждой папке
+```
 Зачем: найти объекты на изображении (bbox + класс).
 
 Что внутри:
@@ -301,8 +300,10 @@ Production deployment ONNX-моделей.
 Latency-critical задачи.
 
 FP16/INT8 квантизация.
+```
 
-Общие требования
+## Общие требования
+```
 GPU и драйверы
 Убедись, что nvidia-container-toolkit установлен и GPU доступен Docker'у:
 
@@ -315,8 +316,10 @@ Shared memory
 
 Диск
 Запас свободного места на хосте — минимум 20 GB на датасет + чекпоинты. Для 3D-задач — 50 GB.
+```
 
-Быстрый старт
+## Быстрый старт
+```
 bash
 # 1. Подготовка директорий
 mkdir -p datasets runs logs work_dirs output
@@ -340,8 +343,10 @@ docker run -it --rm --gpus all --shm-size=8g \
 ls ../logs/plots/                       # графики
 ls ../runs/train/yolov9-mydata/weights/ # best.pt и best.onnx
 Подробности по каждой модели — в README соответствующей папки.
+```
 
-Общие принципы
+## Общие принципы
+```
 Единый пайплайн
 Все контейнеры следуют одной схеме:
 
@@ -382,7 +387,10 @@ docker run -it --rm --gpus all --shm-size=8g \
     -v $(pwd)/logs:/workspace/logs \
     -e <параметры> \
     <image>
-Лицензии
+```
+
+## Лицензии
+```
 Все 41 контейнер — commercial-clean. Можно использовать в закрытых коммерческих продуктах без раскрытия кода.
 
 Тип лицензии	Модели
@@ -390,3 +398,4 @@ MIT	YOLOv9, ByteTrack, MiDaS, UniFace, RetinaFace, Table Transformer, BigGAN
 Apache 2.0	RF-DETR, D-FINE, MMDetection, MMDetection3D, Detectron2 (все), Double Head, DeepLabV3+, U-Net, SegFormer, PIDNet, Mask2Former, MONAI, LightOnOCR, PaddleOCR, MMOCR, timm, MMPretrain, Anomalib, PatchCore, MMTracking, MMPose, RTMPose, Depth Anything V2, Real-ESRGAN, MMagic, LayoutParser, MMAction2, VideoMAE, FLUX.2 [klein] 4B
 CreativeML Open RAIL++-M	Stable Diffusion XL (коммерчески разрешена с ограничениями)
 NVIDIA SLA	TensorRT (бесплатно, только для NVIDIA GPU)
+```
