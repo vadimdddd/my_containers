@@ -20,7 +20,8 @@
 | `my_classification_...`   | Классификация, anomaly detection, GAN               |     5       | timm, MMPretrain, Anomalib, PatchCore, BigGAN                           |
 | `my_tracking_pose_...`    | Трекинг, pose, keypoints                            |     6       | ByteTrack, MMTracking, MMPose, RTMPose, (MMPose, Detectron2)-Keypoint   |
 | `my_depth_estimation...`  | Depth, restoration, face, docs, видео, генерация    |     12      | Depth Anything V2, MiDaS, Real-ESRGAN, MMagic, UniFace, RetinaFace      |
-|                           |                                                     |             | LayoutParser, Table Transformer, MMAction2, VideoMAE, FLUX.2[klein4B]   | |                           |                                                     |             | SDXL                                                                    |
+|                           |                                                     |             | LayoutParser, Table Transformer, MMAction2, VideoMAE, FLUX.2[klein4B]   |
+|                           |                                                     |             | SDXL                                                                    |
 | `my_optimization`         | Оптимизация инференса                               |     1       | TensorRT 10.x                                                           |
 |---------------------------|-----------------------------------------------------|:-----------:|-------------------------------------------------------------------------|
 ```
