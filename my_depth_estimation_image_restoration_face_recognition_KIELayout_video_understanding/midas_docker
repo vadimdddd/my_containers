@@ -1,0 +1,114 @@
+# =============================================================================
+# midas_docker.dockerfile
+# MiDaS v3.1 (MIT) — monocular depth estimation (Intel ISL).
+#
+# ЧТО ЭТО:
+#   MiDaS — классический depth estimator, предшественник Depth Anything.
+#   Архитектура: DPT head + разные backbone (Swin, BEiT, ViT).
+#
+# ВАРИАНТЫ:
+#   dpt-swinv2-tiny-256:  ~60 fps 1080p на 3090, минимум VRAM 
+#   dpt-beit-large-512:   ~6 fps, best quality 
+#
+# ЛИЦЕНЗИЯ: MIT 
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir \
+    transformers \
+    accelerate \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    Pillow
+
+RUN mkdir -p /workspace/images /workspace/runs /workspace/logs
+
+# =============================================================================
+# ИНФЕРЕНС: MiDaS через transformers
+# =============================================================================
+COPY <<'PYTHON' /workspace/inference.py
+"""
+MiDaS inference через transformers (DPTForDepthEstimation).
+"""
+import os, time, argparse
+import cv2
+import numpy as np
+from PIL import Image
+import torch
+from transformers import DPTImageProcessor, DPTForDepthEstimation
+
+MODELS = {
+    "tiny": "Intel/dpt-swinv2-tiny-256",
+    "large": "Intel/dpt-beit-large-512",
+}
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", default="/workspace/runs/midas_output")
+    p.add_argument("--size", default="tiny", choices=list(MODELS.keys()))
+    p.add_argument("--log", default="/workspace/logs/midas.log")
+    args = p.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+
+    with open(args.log, "a") as f:
+        f.write(f"=== MiDaS Inference ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Model: {args.size} ({MODELS[args.size]})\n")
+
+    processor = DPTImageProcessor.from_pretrained(MODELS[args.size])
+    model = DPTForDepthEstimation.from_pretrained(MODELS[args.size]).cuda().eval()
+
+    if os.path.isdir(args.input):
+        images = sorted([os.path.join(args.input, f)
+                         for f in os.listdir(args.input)
+                         if f.endswith(('.jpg', '.jpeg', '.png'))])
+    else:
+        images = [args.input]
+
+    for img_path in images:
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        image = Image.open(img_path).convert("RGB")
+
+        inputs = processor(images=image, return_tensors="pt").to("cuda")
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            outputs = model(**inputs)
+            predicted_depth = outputs.predicted_depth
+        latency = (time.perf_counter() - t0) * 1000
+
+        # Интерполяция до исходного размера
+        prediction = torch.nn.functional.interpolate(
+            predicted_depth.unsqueeze(1),
+            size=image.size[::-1],
+            mode="bicubic",
+            align_corners=False,
+        ).squeeze().cpu().numpy()
+
+        depth_norm = (prediction - prediction.min()) / (prediction.max() - prediction.min() + 1e-8)
+        depth_uint8 = (depth_norm * 255).astype(np.uint8)
+
+        cv2.imwrite(os.path.join(args.output, base + "_depth.png"), depth_uint8)
+        colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
+        cv2.imwrite(os.path.join(args.output, base + "_depth_color.png"), colored)
+
+        with open(args.log, "a") as f:
+            f.write(f"{base}: {latency:.2f} ms\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

@@ -1,0 +1,126 @@
+# =============================================================================
+# depth_anything_docker.dockerfile
+# Depth Anything V2 (Apache 2.0) — monocular depth estimation.
+#
+# ЧТО ЭТО:
+#   Depth Anything V2 — SOTA monocular depth estimation 2024.
+#   Архитектура: DINOv2 encoder + DPT head.
+#   Нативный вход: 518?518. Выход: inverse-relative depth.
+#
+# ВАРИАНТЫ:
+#   Small: ~25M params, ~40 fps 1080p на RTX 3090 
+#   Base:  ~97M params, ~20 fps 
+#   Large: ~335M params, ~8 fps, sharpest edges 
+#
+# METRIC FINE-TUNES:
+#   Metric-Indoor:  Hypersim, глубина в метрах, до 20 м 
+#   Metric-Outdoor: Virtual KITTI, до 80 м 
+#
+# ЛИЦЕНЗИЯ: Apache 2.0 (модель), MIT для MiDaS [citation:1][citation:8]
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir \
+    transformers \
+    accelerate \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    Pillow \
+    tqdm
+
+RUN mkdir -p /workspace/images /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# ИНФЕРЕНС: Depth Anything V2
+# =============================================================================
+COPY <<'PYTHON' /workspace/inference.py
+"""
+Depth Anything V2 inference.
+
+Использует HuggingFace pipeline("depth-estimation") 
+"""
+import os, time, argparse
+import cv2
+import numpy as np
+import torch
+from PIL import Image
+from transformers import pipeline
+
+MODELS = {
+    "small": "depth-anything/Depth-Anything-V2-Small-hf",
+    "base": "depth-anything/Depth-Anything-V2-Base-hf",
+    "large": "depth-anything/Depth-Anything-V2-Large-hf",
+    "metric-indoor": "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
+    "metric-outdoor": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
+}
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", required=True, help="Image or directory")
+    p.add_argument("--output", default="/workspace/runs/depth_output")
+    p.add_argument("--size", default=os.environ.get("DEPTH_SIZE", "small"),
+                   choices=list(MODELS.keys()))
+    p.add_argument("--log", default="/workspace/logs/depth.log")
+    args = p.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+
+    with open(args.log, "a") as f:
+        f.write(f"=== Depth Anything V2 Inference ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Model: {args.size} ({MODELS[args.size]})\n")
+
+    pipe = pipeline("depth-estimation", model=MODELS[args.size], device=0)
+
+    # Собираем изображения
+    if os.path.isdir(args.input):
+        images = sorted([os.path.join(args.input, f)
+                         for f in os.listdir(args.input)
+                         if f.endswith(('.jpg', '.jpeg', '.png'))])
+    else:
+        images = [args.input]
+
+    for img_path in images:
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        image = Image.open(img_path).convert("RGB")
+
+        t0 = time.perf_counter()
+        result = pipe(image)
+        latency = (time.perf_counter() - t0) * 1000
+
+        depth = result["depth"]  # PIL Image
+        depth_np = np.array(depth)
+
+        # Нормализация для визуализации
+        depth_norm = (depth_np - depth_np.min()) / (depth_np.max() - depth_np.min() + 1e-8)
+        depth_uint8 = (depth_norm * 255).astype(np.uint8)
+
+        out_path = os.path.join(args.output, base + "_depth.png")
+        cv2.imwrite(out_path, depth_uint8)
+
+        # Цветная карта
+        colored = cv2.applyColorMap(depth_uint8, cv2.COLORMAP_INFERNO)
+        cv2.imwrite(os.path.join(args.output, base + "_depth_color.png"), colored)
+
+        with open(args.log, "a") as f:
+            f.write(f"{base}: {latency:.2f} ms\n")
+
+        print(f"{base}: {latency:.2f} ms > {out_path}")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

@@ -1,0 +1,172 @@
+# =============================================================================
+# anomalib_docker.dockerfile
+# Anomalib (Apache 2.0) — anomaly detection на нормальных данных.
+#
+# НАЗНАЧЕНИЕ:
+#   - Обучение ТОЛЬКО на нормальных изображениях.
+#   - Поиск аномалий без разметки дефектов.
+#   - 15+ алгоритмов (PatchCore, PaDiM, FastFlow и др.).
+#
+# ПОЧЕМУ Anomalib:
+#   - Intel-фреймворк, production-ready
+#   - PatchCore даёт 0.980 AUROC на MVTec AD [citation:1]
+#   - Robust к domain shift [citation:8]
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir anomalib[full]
+
+RUN pip install --no-cache-dir \
+    onnx onnxruntime \
+    scikit-learn \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# СТАДИЯ 0: КОНВЕРТАЦИЯ ДАТАСЕТА
+#   LabelMe JSON > формат MVTec AD (только нормальные + аномальные для теста)
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""
+LabelMe JSON > формат Anomalib (MVTec-like).
+
+СТРУКТУРА:
+  datasets/mvtec/
+    L-- category/
+        +-- train/good/*.jpg       # только нормальные
+        +-- test/good/*.jpg
+        L-- test/anomaly/*.jpg     # дефектные
+"""
+import os, glob, json, shutil
+import numpy as np
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+OUT_DIR = os.environ.get("ANOMALIB_DATA_DIR", "/workspace/anomalib_data")
+CATEGORY = os.environ.get("CATEGORY", "default")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+
+def has_defect(json_path, label_list):
+    with open(json_path, encoding='utf-8') as f:
+        data = json.load(f)
+    for shape in data.get('shapes', []):
+        if shape['label'] in label_list:
+            return True
+    return False
+
+def main():
+    obj_path = os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)
+    with open(obj_path) as f:
+        LABEL_LIST = [l.strip() for l in f if l.strip()]
+
+    train_good = os.path.join(OUT_DIR, 'mvtec', CATEGORY, 'train', 'good')
+    test_good = os.path.join(OUT_DIR, 'mvtec', CATEGORY, 'test', 'good')
+    test_anom = os.path.join(OUT_DIR, 'mvtec', CATEGORY, 'test', 'anomaly')
+    for d in [train_good, test_good, test_anom]:
+        os.makedirs(d, exist_ok=True)
+
+    normal_count, anomaly_count = 0, 0
+    for dp, dn, fn in os.walk(DATASETS_DIR):
+        for jp in glob.glob(os.path.join(dp, '*.json')):
+            base = os.path.splitext(os.path.basename(jp))[0]
+            jpg = os.path.join(dp, base + '.jpg')
+            if not os.path.exists(jpg):
+                continue
+            is_defect = has_defect(jp, LABEL_LIST)
+            if is_defect:
+                shutil.copy2(jpg, os.path.join(test_anom, base + '.jpg'))
+                anomaly_count += 1
+            else:
+                shutil.copy2(jpg, os.path.join(train_good, base + '.jpg'))
+                shutil.copy2(jpg, os.path.join(test_good, base + '.jpg'))
+                normal_count += 1
+
+    print(f"Normal: {normal_count}, Anomaly: {anomaly_count}")
+    print(f"Data ready at: {OUT_DIR}")
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 1: ТРЕНИРОВКА
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== Anomalib Training ==="
+echo "Timestamp: $(date)"
+echo "Model: ${ANOMALIB_MODEL:-Patchcore}"
+echo "Category: ${CATEGORY:-default}"
+echo "---"
+
+anomalib train \
+    --model ${ANOMALIB_MODEL:-Patchcore} \
+    --data anomalib.data.MVTecAD \
+    --data.root ${ANOMALIB_DATA_DIR:-/workspace/anomalib_data}/mvtec \
+    --data.category ${CATEGORY:-default} \
+    --data.train_batch_size 32 \
+    --data.eval_batch_size 32 \
+    --trainer.max_epochs ${EPOCHS:-50} \
+    --trainer.default_root_dir /workspace/runs/anomalib
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+# =============================================================================
+# СТАДИЯ 2: ТЕСТ
+# =============================================================================
+COPY <<'SHELL' /workspace/02_test.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test.log}
+{
+echo "=== Anomalib Test ==="
+anomalib test \
+    --model ${ANOMALIB_MODEL:-Patchcore} \
+    --data anomalib.data.MVTecAD \
+    --data.root ${ANOMALIB_DATA_DIR:-/workspace/anomalib_data}/mvtec \
+    --data.category ${CATEGORY:-default} \
+    --ckpt_path ${CHECKPOINT}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test.sh
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "Anomalib Pipeline START"
+CURRENT_STEP="0/3 CONVERT"; log "STEP 0/3: Converting LabelMe > MVTec format"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/3 TRAIN"; log "STEP 1/3: Training"
+bash /workspace/01_train.sh
+
+CURRENT_STEP="2/3 TEST"; log "STEP 2/3: Testing"
+bash /workspace/02_test.sh
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

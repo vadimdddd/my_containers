@@ -1,0 +1,221 @@
+# =============================================================================
+# mmpose_keypoint_docker.dockerfile
+# MMPose v0.29.0 (Apache 2.0) — custom keypoint detection.
+#
+# ОТЛИЧИЕ ОТ POSE:
+#   Pose estimation — это keypoints на человеке (суставы).
+#   Keypoint detection — это любые точки на любых объектах.
+#   Например: углы детали, центры отверстий, кончики проводов.
+#
+# НАСТРОЙКА:
+#   - NUM_KEYPOINTS: число ключевых точек.
+#   - keypoint_head.out_channels: должно совпадать с NUM_KEYPOINTS.
+#   - keypoint names и skeleton: задаются в датасете.
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ:
+#   MMPose 0.29.0 + mmcv-full 1.7.0 + torch 1.10.0 + cu113 [citation:2][citation:6]
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+RUN git clone -b 'v0.29.0' https://github.com/open-mmlab/mmpose.git . \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir xtcocotools
+
+RUN pip install --no-cache-dir \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/work_dirs
+
+# =============================================================================
+# ГЕНЕРАТОР КОНФИГА для custom keypoints
+# =============================================================================
+COPY <<'PYTHON' /workspace/generate_config.py
+"""
+Генератор конфига MMPose для custom keypoints.
+
+Ключевое отличие от стандартного MMPose:
+  keypoint_head.out_channels = NUM_KEYPOINTS
+  dataset_info.keypoint_num = NUM_KEYPOINTS
+  dataset_info.keypoint_name = [...]
+  dataset_info.skeleton = [...]
+"""
+import os, argparse
+from pathlib import Path
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--num-keypoints", type=int, default=int(os.environ.get("NUM_KEYPOINTS", "4")))
+    p.add_argument("--keypoint-names", nargs="+",
+                   default=os.environ.get("KEYPOINT_NAMES", "kp0 kp1 kp2 kp3").split())
+    p.add_argument("--input-size", default=os.environ.get("INPUT_SIZE", "256x256"))
+    p.add_argument("--config", default=os.environ.get("CONFIG", ""))
+    args = p.parse_args()
+
+    if args.config:
+        print(f"[INFO] CONFIG set, using: {args.config}")
+        print(args.config)
+        return
+
+    w, h = map(int, args.input_size.split("x"))
+    num_kpts = args.num_keypoints
+    names = args.keypoint_names
+
+    # Базовый конфиг HRNet-W32 + TopdownHeatmapSimpleHead
+    config = f"""# Custom Keypoint Config (auto-generated)
+dataset_type = 'CocoDataset'
+data_root = '/workspace/mmpose/data/custom_pose'
+input_size = ({w}, {h})
+
+keypoint_info = {{
+"""
+    for i, name in enumerate(names):
+        config += f"    {i}: dict(name='{name}', id={i}, color=[255, 128, 0], type='', swap=''),\n"
+    config += "}\n\n"
+
+    config += f"""dataset_info = dict(
+    dataset_name='custom_keypoints',
+    paper_info=dict(author='', title='', container='', year=''),
+    keypoint_info=keypoint_info,
+    skeleton_info={{}},
+    joint_weights=[1.] * {num_kpts},
+    sigmas=[0.025] * {num_kpts},
+)
+
+model = dict(
+    type='TopDown',
+    backbone=dict(
+        type='HRNet',
+        in_channels=3,
+        extra=dict(
+            stage1=dict(num_modules=1, num_branches=1, block='BOTTLENECK',
+                        num_blocks=(4,), num_channels=(64,)),
+            stage2=dict(num_modules=1, num_branches=2, block='BASIC',
+                        num_blocks=(4, 4), num_channels=(32, 64)),
+            stage3=dict(num_modules=4, num_branches=3, block='BASIC',
+                        num_blocks=(4, 4, 4), num_channels=(32, 64, 128)),
+            stage4=dict(num_modules=3, num_branches=4, block='BASIC',
+                        num_blocks=(4, 4, 4, 4), num_channels=(32, 64, 128, 256)))),
+    keypoint_head=dict(
+        type='TopdownHeatmapSimpleHead',
+        in_channels=256,
+        out_channels={num_kpts},  # NUM_KEYPOINTS
+        num_deconv_layers=0,
+        extra=dict(final_conv_kernel=1),
+        loss_keypoint=dict(type='JointsMSELoss', use_target_weight=True)),
+    train_cfg=dict(),
+    test_cfg=dict(flip_test=False, post_process='unbiased',
+                  shift_heatmap=True, modulate_kernel=11),
+)
+
+data = dict(
+    samples_per_gpu=16,
+    workers_per_gpu=2,
+    val_dataloader=dict(samples_per_gpu=16),
+    test_dataloader=dict(samples_per_gpu=16),
+    train=dict(
+        type='TopDownCocoDataset',
+        ann_file=f'{{data_root}}/annotations/train.json',
+        img_prefix=f'{{data_root}}/images/train/',
+        data_cfg=dict(
+            image_size=[{w}, {h}],
+            heatmap_size=[{w // 4}, {h // 4}],
+            num_output_channels={num_kpts},
+            num_joints={num_kpts},
+            dataset_joints={num_kpts},
+            dataset_channel=[list(range({num_kpts}))],
+            inference_channel=list(range({num_kpts})),
+            max_num_people=30,
+            scale_factor=0.75,
+        ),
+        pipeline=[]),
+    val=dict(
+        type='TopDownCocoDataset',
+        ann_file=f'{{data_root}}/annotations/val.json',
+        img_prefix=f'{{data_root}}/images/val/',
+        data_cfg=dict(
+            image_size=[{w}, {h}],
+            heatmap_size=[{w // 4}, {h // 4}],
+            num_output_channels={num_kpts},
+            num_joints={num_kpts},
+            dataset_joints={num_kpts},
+            dataset_channel=[list(range({num_kpts}))],
+            inference_channel=list(range({num_kpts})),
+            max_num_people=30,
+            scale_factor=0.75,
+        ),
+        pipeline=[]),
+)
+
+optimizer = dict(type='Adam', lr=1e-3)
+optimizer_config = dict(grad_clip=None)
+lr_config = dict(policy='step', warmup='linear',
+                 warmup_iters=500, warmup_ratio=0.001, step=[170, 200])
+total_epochs = 210
+"""
+
+    out_path = Path("/workspace/work_dirs/generated_config.py")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(config)
+    print(f"[OK] Generated: {out_path}")
+    return str(out_path)
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== MMPose Keypoint Training ==="
+echo "Config: ${GENERATED_CONFIG}"
+cd /workspace/mmpose
+python tools/train.py ${GENERATED_CONFIG:-${CONFIG}} --work-dir /workspace/work_dirs/${RUN_NAME:-keypoint}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/work_dirs
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "MMPose Keypoint Pipeline START"
+CURRENT_STEP="0/4 CONFIG"; log "STEP 0/4: Generating config"
+GENERATED=$(python /workspace/generate_config.py)
+export GENERATED_CONFIG="${GENERATED}"
+
+CURRENT_STEP="1/4 CONVERT"; log "STEP 1/4: Converting LabelMe > COCO"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="2/4 TRAIN"; log "STEP 2/4: Training"
+bash /workspace/01_train.sh
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

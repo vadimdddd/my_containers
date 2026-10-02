@@ -1,0 +1,161 @@
+# =============================================================================
+# bytetrack_docker.dockerfile
+# ByteTrack (MIT) — multi-object tracking (MOT) поверх готовых детекций.
+#
+# ВАЖНО:
+#   ByteTrack — это НЕ обучаемая модель, а алгоритм трекинга.
+#   Он принимает готовые детекции (от YOLO) и связывает их во времени.
+#   Dockerfile — инференс-пайплайн: детектор + трекер + анализ.
+#
+# АРХИТЕКТУРА:
+#   ByteTrack использует association по двум порогам:
+#   - High-confidence detections > основной трек
+#   - Low-confidence detections > дополнительная ассоциация
+#   Это позволяет восстанавливать объекты при кратковременных окклюзиях [citation:38]
+#
+# ЛИЦЕНЗИЯ: MIT
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# ByteTrack + зависимости
+RUN git clone https://github.com/ifzhang/ByteTrack.git . \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir cython_bbox
+
+# Дополнительные зависимости
+RUN pip install --no-cache-dir \
+    ultralytics \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    tqdm
+
+RUN mkdir -p /workspace/videos /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# ИНФЕРЕНС: детекция + трекинг + сохранение видео
+# =============================================================================
+COPY <<'PYTHON' /workspace/track.py
+"""
+ByteTrack inference pipeline: YOLO detection + ByteTrack association.
+
+ВХОД: видеофайл
+ВЫХОД: видео с треками + CSV с траекториями + логи
+"""
+import os, time, argparse, csv
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import sys
+sys.path.insert(0, '/workspace')
+from yolox.tracker.byte_tracker import BYTETracker
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--video", required=True, help="Path to input video")
+    p.add_argument("--output", default="/workspace/runs/tracked.mp4")
+    p.add_argument("--csv", default="/workspace/runs/tracks.csv")
+    p.add_argument("--model", default=os.environ.get("YOLO_MODEL", "yolov8n.pt"))
+    p.add_argument("--conf", type=float, default=0.3)
+    p.add_argument("--log", default="/workspace/logs/track.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== ByteTrack Inference ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Video: {args.video}\nModel: {args.model}\n")
+
+    # YOLO детектор
+    model = YOLO(args.model)
+
+    # ByteTrack трекер
+    tracker_args = lambda: None
+    tracker_args.track_thresh = 0.5
+    tracker_args.track_buffer = 30
+    tracker_args.match_thresh = 0.8
+    tracker_args.mot20 = False
+
+    tracker = BYTETracker(tracker_args, frame_rate=30)
+
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+
+    csv_file = open(args.csv, 'w', newline='')
+    csv_writer = csv.writer(csv_file)
+    csv_writer.writerow(['frame', 'track_id', 'x1', 'y1', 'x2', 'y2', 'class_id', 'score'])
+
+    frame_idx = 0
+    total_tracks = set()
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Детекция
+        results = model(frame, conf=args.conf, verbose=False)[0]
+
+        # Формируем detections для ByteTrack
+        if results.boxes is not None and len(results.boxes) > 0:
+            boxes = results.boxes.xyxy.cpu().numpy()
+            scores = results.boxes.conf.cpu().numpy()
+            classes = results.boxes.cls.cpu().numpy()
+
+            # ByteTrack ожидает [x1, y1, x2, y2, score, class]
+            dets = np.column_stack([boxes, scores, classes])
+
+            # Обновляем трекер
+            online_targets = tracker.update(
+                torch.from_numpy(dets).float(),
+                [h, w], [h, w]
+            )
+
+            for t in online_targets:
+                tlwh = t.tlwh
+                tid = t.track_id
+                total_tracks.add(tid)
+
+                # Рисуем
+                x, y, bw, bh = tlwh
+                cv2.rectangle(frame, (int(x), int(y)), (int(x+bw), int(y+bh)), (0, 255, 0), 2)
+                cv2.putText(frame, f"ID {tid}", (int(x), int(y)-5),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+                csv_writer.writerow([frame_idx, tid, int(x), int(y), int(x+bw), int(y+bh), 0, 0.0])
+
+        writer.write(frame)
+        frame_idx += 1
+
+        if frame_idx % 100 == 0:
+            print(f"Processed {frame_idx} frames, active tracks: {len(total_tracks)}")
+
+    cap.release()
+    writer.release()
+    csv_file.close()
+
+    with open(args.log, "a") as f:
+        f.write(f"Total frames: {frame_idx}\n")
+        f.write(f"Total unique tracks: {len(total_tracks)}\n")
+        f.write(f"Output video: {args.output}\n")
+        f.write(f"Output CSV: {args.csv}\n")
+
+    print(f"Tracking complete. Unique tracks: {len(total_tracks)}")
+
+if __name__ == "__main__":
+    import torch
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

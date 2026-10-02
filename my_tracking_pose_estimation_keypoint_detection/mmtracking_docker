@@ -1,0 +1,231 @@
+# =============================================================================
+# mmtracking_docker.dockerfile
+# MMTracking v0.14.0 (Apache 2.0) Ч модульный трекинг от OpenMMLab.
+#
+# Ќј«Ќј„≈Ќ»≈:
+#   - MOT (Multi-Object Tracking): SORT, DeepSORT, ByteTrack, QDTrack.
+#   - SOT (Single-Object Tracking): SiameseRPN, STARK.
+#   - VID (Video Instance Detection).
+#
+# —ќ¬ћ≈—“»ћќ—“№ ¬≈–—»…:
+#   MMTracking 0.14.0 требует mmcv-full>=1.3.17,<2.0.0 и mmdet>=2.19.1,<3.0.0.
+#   ƒл€ mmdet 2.27.0 совместим mmcv-full 1.7.0 [citation:2][citation:17]
+#
+# ¬ј∆Ќќ:
+#   ƒл€ работы MMTracking нужен mmdet. Ѕез него падает на импортах [citation:38]
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+# mmcv-full 1.7.0 (совместим с mmdet 2.27.0 и mmtrack 0.14.0) [citation:2][citation:17]
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+# MMDetection 2.27.0 (зависимость MMTracking)
+RUN pip install --no-cache-dir mmdet==2.27.0
+
+# MMTracking 0.14.0
+RUN git clone -b 'v0.14.0' https://github.com/open-mmlab/mmtracking.git . \
+    && pip install --no-cache-dir -r requirements/build.txt \
+    && pip install --no-cache-dir -v -e .
+
+# ƒополнительные зависимости
+RUN pip install --no-cache-dir \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    tqdm
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmtracking/data /workspace/work_dirs
+
+# =============================================================================
+# —“јƒ»я 0:  ќЌ¬≈–“ј÷»я ƒј“ј—≈“ј
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""
+LabelMe JSON > CocoVID формат дл€ MMTracking.
+
+CocoVID Ч это COCO с добавлением video_id в images и annotations.
+"""
+import os, sys, glob, json, shutil
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+OUT_DIR = os.environ.get("MMTRACK_DATA_DIR", "/workspace/mmtracking/data/custom_mot")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.2"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+
+def find_video_folders(root):
+    """»щем папки с последовательными кадрами (видео-подобные)."""
+    folders = []
+    for dp, dn, fn in os.walk(root):
+        if any(f.endswith('.json') for f in fn):
+            folders.append(dp)
+    return sorted(folders)
+
+def make_coco_vid(video_folders, label_list, out_path, img_dir):
+    """—оздаЄт CocoVID JSON из последовательности кадров."""
+    images, annotations, videos = [], [], []
+    video_id = 0
+    ann_id = 0
+    img_id = 0
+
+    for vid_folder in video_folders:
+        json_files = sorted(glob.glob(os.path.join(vid_folder, '*.json')))
+        if len(json_files) < 2:
+            continue
+
+        video_id += 1
+        videos.append({"id": video_id, "name": os.path.basename(vid_folder)})
+
+        for frame_idx, jp in enumerate(json_files):
+            base = os.path.splitext(os.path.basename(jp))[0]
+            jpg = os.path.join(vid_folder, base + '.jpg')
+            if not os.path.exists(jpg):
+                continue
+
+            img_out = os.path.join(img_dir, base + '.jpg')
+            shutil.copy2(jpg, img_out)
+
+            img = cv2.imread(img_out)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+
+            images.append({
+                "id": img_id,
+                "file_name": base + '.jpg',
+                "width": w, "height": h,
+                "video_id": video_id,
+                "frame_id": frame_idx,
+            })
+
+            with open(jp, encoding='utf-8') as f:
+                data = json.load(f)
+
+            for shape in data.get('shapes', []):
+                label = shape['label']
+                if label not in label_list:
+                    continue
+                pts = np.array(shape['points']).astype(int)
+                x_min, y_min = np.min(pts, axis=0)
+                x_max, y_max = np.max(pts, axis=0)
+                x_min, y_min = max(0, x_min), max(0, y_min)
+                x_max, y_max = min(w, x_max), min(h, y_max)
+                if x_max <= x_min or y_max <= y_min:
+                    continue
+                annotations.append({
+                    "id": ann_id,
+                    "image_id": img_id,
+                    "category_id": label_list.index(label) + 1,
+                    "bbox": [int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)],
+                    "area": int((x_max - x_min) * (y_max - y_min)),
+                    "iscrowd": 0,
+                    "instance_id": ann_id,  # дл€ MOT
+                    "video_id": video_id,
+                })
+                ann_id += 1
+            img_id += 1
+
+    categories = [{"id": i + 1, "name": name} for i, name in enumerate(label_list)]
+    coco_vid = {"images": images, "annotations": annotations,
+                "categories": categories, "videos": videos}
+
+    with open(out_path, 'w') as f:
+        json.dump(coco_vid, f)
+    print(f"[OK] {out_path}: {len(images)} images, {len(annotations)} annotations, {len(videos)} videos")
+
+def main():
+    for sub in ['train', 'val']:
+        os.makedirs(os.path.join(OUT_DIR, 'images', sub), exist_ok=True)
+        os.makedirs(os.path.join(OUT_DIR, 'annotations'), exist_ok=True)
+
+    obj_path = os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)
+    with open(obj_path) as f:
+        LABEL_LIST = [l.strip() for l in f if l.strip()]
+
+    video_folders = find_video_folders(DATASETS_DIR)
+    train_folders, val_folders = train_test_split(
+        video_folders, test_size=SPLIT_SIZE, random_state=RANDOM_STATE
+    )
+
+    make_coco_vid(train_folders, LABEL_LIST,
+                  os.path.join(OUT_DIR, 'annotations', 'train.json'),
+                  os.path.join(OUT_DIR, 'images', 'train'))
+    make_coco_vid(val_folders, LABEL_LIST,
+                  os.path.join(OUT_DIR, 'annotations', 'val.json'),
+                  os.path.join(OUT_DIR, 'images', 'val'))
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# —“јƒ»я 1: “–≈Ќ»–ќ¬ ј
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== MMTracking Training ==="
+echo "Timestamp: $(date)"
+echo "Config: ${CONFIG:-configs/mot/deepsort/deepsort_faster-rcnn_fpn_4e_mot17-private-half.py}"
+echo "---"
+
+cd /workspace/mmtracking
+python tools/train.py ${CONFIG} --work-dir /workspace/work_dirs/${RUN_NAME:-mmtrack}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/02_test.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test.log}
+{
+echo "=== MMTracking Test ==="
+cd /workspace/mmtracking
+python tools/test.py ${CONFIG} ${CHECKPOINT} --eval bbox track
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test.sh
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "MMTracking Pipeline START"
+CURRENT_STEP="0/3 CONVERT"; log "STEP 0/3: Converting LabelMe > CocoVID"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/3 TRAIN"; log "STEP 1/3: Training"
+bash /workspace/01_train.sh
+
+CURRENT_STEP="2/3 TEST"; log "STEP 2/3: Testing"
+bash /workspace/02_test.sh
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

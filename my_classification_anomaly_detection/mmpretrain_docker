@@ -1,0 +1,95 @@
+# =============================================================================
+# mmpretrain_docker.dockerfile
+# MMPretrain (Apache 2.0) — OpenMMLab классификация.
+#
+# НАЗНАЧЕНИЕ:
+#   - Классификация, self-supervised learning, retrieval.
+#   - Модульный конструктор (backbone + head + loss).
+#   - Fine-tuning через конфиги [citation:20][citation:21].
+#
+# ОСОБЕННОСТЬ:
+#   Fine-tuning делается через config inheritance: копируешь базовый конфиг,
+#   меняешь num_classes и frozen_stages [citation:20].
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+# MMPretrain + mmcv
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+RUN git clone -b 'v1.0.0rc8' https://github.com/open-mmlab/mmpretrain.git . \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    onnx onnxruntime onnxsim \
+    scikit-learn \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmpretrain/data /workspace/work_dirs
+
+# Конвертация — та же, что в timm_docker (LabelMe > папки классов)
+COPY <<'PYTHON' /workspace/00_convert.py
+# ... (идентично timm_docker.dockerfile, но OUT_DIR = /workspace/mmpretrain/data/custom)
+PYTHON
+
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== MMPretrain Training ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmpretrain
+# Используем конфиг с кастомным датасетом
+python tools/train.py ${CONFIG:-configs/resnet/resnet50_8xb32_in1k.py} \
+    --work-dir /workspace/work_dirs/${RUN_NAME:-mmpretrain}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/02_test.sh
+#!/bin/bash
+set -e
+cd /workspace/mmpretrain
+python tools/test.py ${CONFIG} ${CHECKPOINT} --metrics accuracy
+SHELL
+RUN chmod +x /workspace/02_test.sh
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "MMPretrain Pipeline START"
+CURRENT_STEP="0/4 CONVERT"; log "STEP 0/4: Converting LabelMe > class folders"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/4 TRAIN"; log "STEP 1/4: Training"
+bash /workspace/01_train.sh
+
+CURRENT_STEP="2/4 TEST"; log "STEP 2/4: Testing"
+bash /workspace/02_test.sh
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

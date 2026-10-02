@@ -1,0 +1,64 @@
+# =============================================================================
+# mmaction2_docker.dockerfile
+# MMAction2 (Apache 2.0) — video understanding / action recognition.
+#
+# ЧТО ЭТО:
+#   MMAction2 — OpenMMLab тулкит для video understanding:
+#   action recognition, temporal detection, spatio-temporal detection.
+#   Лицензия Apache 2.0 [citation:6][citation:19].
+#
+# МОДЕЛИ:
+#   VideoMAE, MViT V2, UniFormer, TSN, TSM, SlowFast и др.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+# MMAction2
+RUN git clone -b 'v1.0.0' https://github.com/open-mmlab/mmaction2.git . \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/videos /workspace/runs /workspace/logs /workspace/work_dirs
+
+COPY <<'SHELL' /workspace/inference.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/inference.log}
+{
+echo "=== MMAction2 Inference ==="
+echo "Timestamp: $(date)"
+echo "Config: ${CONFIG}"
+echo "Checkpoint: ${CHECKPOINT}"
+echo "---"
+
+cd /workspace/mmaction2
+python demo/demo.py \
+    ${CONFIG} \
+    ${CHECKPOINT} \
+    ${VIDEO} \
+    --label-map ${LABEL_MAP:-tools/data/kinetics/label_map_k400.txt} \
+    --out-filename ${OUTPUT:-/workspace/runs/action_demo.mp4}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/inference.sh
+
+ENTRYPOINT ["/bin/bash"]

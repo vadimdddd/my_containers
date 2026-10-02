@@ -1,0 +1,127 @@
+# =============================================================================
+# mask2former_docker.dockerfile
+# Mask2Former (Apache 2.0, MMSegmentation v0.30.0) Ч universal segmentation.
+#
+# ј–’»“≈ “”–ј:
+#   Masked-attention Mask Transformer. ”ниверсальна€: semantic + instance + panoptic.
+#   Backbone: ResNet-50 / Swin.
+#
+# ѕќ„≈ћ” Mask2Former:
+#   - SOTA на Cityscapes: R-50 даЄт 80.44 mIoU, Swin-L Ч 83.52 mIoU [citation:18]
+#   - ”ниверсальна€: одна архитектура дл€ всех типов сегментации
+#   - ”стойчива к изменени€м контраста (в отличие от U-Net и SegFormer)
+#
+# ¬ј∆Ќќ:
+#   Mask2Former требует MMDetection. Ѕез него падает с TypeError [citation:14].
+#   ¬ Dockerfile установлен mmdet==2.27.0.
+#
+# —ќ¬ћ≈—“»ћќ—“№ ¬≈–—»…:
+#   MMSegmentation v0.30.0 + mmcv-full 1.7.0 + torch 1.10.0 + cu113.
+#   mmdet==2.27.0 дл€ Mask2FormerHead.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+RUN git clone -b 'v0.30.0' https://github.com/open-mmlab/mmsegmentation.git . \
+    && pip install --no-cache-dir -v -e .
+
+# MMDetection Ч ќЅя«ј“≈Ћ≈Ќ дл€ Mask2Former
+RUN pip install --no-cache-dir mmdet==2.27.0
+
+RUN pip install --no-cache-dir pybind11 onnxruntime onnx onnxsim \
+    && git clone -b 'v0.12.0' https://github.com/open-mmlab/mmdeploy.git /workspace/mmdeploy \
+    && cd /workspace/mmdeploy && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    scikit-learn lxml \
+    pycocotools supervision \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmsegmentation/data /workspace/work_dirs
+
+# 00_convert.py Ч идентичен unet_docker.dockerfile
+COPY <<'PYTHON' /workspace/00_convert.py
+# ... (тот же код конвертации LabelMe > PNG masks)
+PYTHON
+
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== Mask2Former Training ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmsegmentation
+python tools/train.py ${CONFIG:-configs/mask2former/mask2former_r50_8xb2-90k_cityscapes-512x1024.py} \
+    --work-dir /workspace/work_dirs/${RUN_NAME:-mask2former}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/02_test_pth.sh
+#!/bin/bash
+set -e
+cd /workspace/mmsegmentation
+python tools/test.py ${CONFIG} ${TRAINED_WEIGHTS} --eval mIoU
+SHELL
+RUN chmod +x /workspace/02_test_pth.sh
+
+COPY <<'SHELL' /workspace/03_export_onnx.sh
+#!/bin/bash
+set -e
+cd /workspace/mmsegmentation
+python tools/deployment/pytorch2onnx.py ${CONFIG} ${TRAINED_WEIGHTS} \
+    --output-file ${ONNX_PATH} --shape 512 1024 --verify
+SHELL
+RUN chmod +x /workspace/03_export_onnx.sh
+
+COPY <<'PYTHON' /workspace/04_test_onnx.py
+# ... (тот же код ONNX-теста, что в unet_docker.dockerfile)
+PYTHON
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "Mask2Former Pipeline START"
+CURRENT_STEP="0/6 CONVERT"; log "STEP 0/6: Converting LabelMe > masks"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/6 TRAIN"; log "STEP 1/6: Training"
+bash /workspace/01_train.sh
+
+CURRENT_STEP="2/6 TEST PTH"; log "STEP 2/6: Testing .pth"
+bash /workspace/02_test_pth.sh
+
+CURRENT_STEP="3/6 EXPORT"; log "STEP 3/6: Exporting ONNX"
+bash /workspace/03_export_onnx.sh
+
+CURRENT_STEP="4/6 TEST ONNX"; log "STEP 4/6: Testing .onnx"
+python /workspace/04_test_onnx.py
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

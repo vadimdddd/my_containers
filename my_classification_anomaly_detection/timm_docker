@@ -1,0 +1,296 @@
+# =============================================================================
+# timm_docker.dockerfile
+# timm (Apache 2.0) — image classification с 800+ предобученными моделями.
+#
+# НАЗНАЧЕНИЕ:
+#   - Классификация изображений (ResNet, EfficientNet, ViT, ConvNeXt).
+#   - Fine-tuning на кастомных данных.
+#   - Экспорт в ONNX.
+#
+# ПОЧЕМУ timm:
+#   - Простой API: timm.create_model('resnet50', pretrained=True) [citation:13]
+#   - 800+ моделей из torchvision, HuggingFace, оригинальных репозиториев
+#   - Работает с любым backbone через единый интерфейс
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir \
+    timm \
+    albumentations \
+    onnx onnxruntime onnxsim \
+    scikit-learn \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    tqdm
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# СТАДИЯ 0: КОНВЕРТАЦИЯ ДАТАСЕТА
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""
+LabelMe JSON > папки классов для timm.
+
+ФОРМАТ:
+  datasets/
+    +-- train/
+    ¦   +-- class_0/*.jpg
+    ¦   +-- class_1/*.jpg
+    ¦   L-- ...
+    L-- val/
+        +-- class_0/*.jpg
+        L-- ...
+"""
+import os, sys, glob, json, shutil
+from sklearn.model_selection import train_test_split
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+OUT_DIR = os.environ.get("TIMM_DATA_DIR", "/workspace/timm_data")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.2"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+
+def find_subfolders(root):
+    trainval, test = [], []
+    for dp, dn, fn in os.walk(root):
+        if not any(f.endswith('.json') for f in fn):
+            continue
+        d = os.path.basename(dp).lower()
+        if 'test' in d:
+            test.append(dp)
+        else:
+            trainval.append(dp)
+    return sorted(trainval), sorted(test)
+
+def get_label_from_json(json_path, label_list):
+    with open(json_path, encoding='utf-8') as f:
+        data = json.load(f)
+    labels = set()
+    for shape in data.get('shapes', []):
+        if shape['label'] in label_list:
+            labels.add(shape['label'])
+    return list(labels)
+
+def main():
+    obj_path = os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)
+    with open(obj_path) as f:
+        LABEL_LIST = [l.strip() for l in f if l.strip()]
+    print(f"Classes: {LABEL_LIST}")
+
+    paths_trainval, paths_test = find_subfolders(DATASETS_DIR)
+
+    all_samples = []  # (json_path, label)
+    for p in paths_trainval:
+        for jp in sorted(glob.glob(os.path.join(p, '*.json'))):
+            labels = get_label_from_json(jp, LABEL_LIST)
+            # Берем первый класс (для multi-label нужна другая логика)
+            if labels:
+                all_samples.append((jp, labels[0]))
+
+    train_samples, val_samples = train_test_split(
+        all_samples, test_size=SPLIT_SIZE, random_state=RANDOM_STATE,
+        stratify=[s[1] for s in all_samples] if len(set(s[1] for s in all_samples)) > 1 else None
+    )
+
+    for split_name, samples in [('train', train_samples), ('val', val_samples)]:
+        for jp, label in samples:
+            base = os.path.splitext(os.path.basename(jp))[0]
+            src_dir = os.path.dirname(jp)
+            jpg = os.path.join(src_dir, base + '.jpg')
+            if not os.path.exists(jpg):
+                continue
+            dst_dir = os.path.join(OUT_DIR, split_name, label)
+            os.makedirs(dst_dir, exist_ok=True)
+            shutil.copy2(jpg, os.path.join(dst_dir, base + '.jpg'))
+
+    print(f"Train: {len(train_samples)}, Val: {len(val_samples)}")
+    print(f"Data ready at: {OUT_DIR}")
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 1: ТРЕНИРОВКА (timm training script)
+# =============================================================================
+COPY <<'PYTHON' /workspace/01_train.py
+"""
+Fine-tuning timm модели на кастомных данных.
+
+ПОЧЕМУ такой подход:
+  timm имеет встроенный train.py, но он требует специфичного формата.
+  Проще написать свой цикл с использованием timm.create_model() [citation:13]
+"""
+import os, time, argparse
+import torch
+import torch.nn as nn
+import timm
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from sklearn.metrics import accuracy_score, f1_score
+import numpy as np
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data", default=os.environ.get("TIMM_DATA_DIR", "/workspace/timm_data"))
+    p.add_argument("--model", default=os.environ.get("MODEL_NAME", "resnet50"))
+    p.add_argument("--epochs", type=int, default=int(os.environ.get("EPOCHS", "10")))
+    p.add_argument("--batch", type=int, default=int(os.environ.get("BATCH", "32")))
+    p.add_argument("--lr", type=float, default=float(os.environ.get("LR", "1e-4")))
+    p.add_argument("--output", default="/workspace/runs/timm")
+    p.add_argument("--log", default="/workspace/logs/01_train.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== timm Training ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Model: {args.model}, Epochs: {args.epochs}, Batch: {args.batch}\n")
+
+    # Transforms
+    train_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+    val_tf = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+    ])
+
+    train_ds = datasets.ImageFolder(os.path.join(args.data, 'train'), transform=train_tf)
+    val_ds = datasets.ImageFolder(os.path.join(args.data, 'val'), transform=val_tf)
+
+    train_loader = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=4)
+
+    num_classes = len(train_ds.classes)
+    print(f"Classes: {num_classes} ({train_ds.classes})")
+
+    # Модель
+    model = timm.create_model(args.model, pretrained=True, num_classes=num_classes)
+    model = model.cuda()
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    criterion = nn.CrossEntropyLoss()
+
+    best_acc = 0.0
+    for epoch in range(args.epochs):
+        model.train()
+        train_loss = 0.0
+        for imgs, labels in train_loader:
+            imgs, labels = imgs.cuda(), labels.cuda()
+            optimizer.zero_grad()
+            outputs = model(imgs)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+
+        # Validation
+        model.eval()
+        all_preds, all_labels = [], []
+        with torch.no_grad():
+            for imgs, labels in val_loader:
+                imgs = imgs.cuda()
+                outputs = model(imgs)
+                preds = outputs.argmax(dim=1).cpu().numpy()
+                all_preds.extend(preds)
+                all_labels.extend(labels.numpy())
+
+        acc = accuracy_score(all_labels, all_preds)
+        f1 = f1_score(all_labels, all_preds, average='weighted')
+
+        with open(args.log, "a") as f:
+            f.write(f"Epoch {epoch+1}/{args.epochs}, Loss: {train_loss/len(train_loader):.4f}, "
+                    f"Val Acc: {acc:.4f}, F1: {f1:.4f}\n")
+        print(f"Epoch {epoch+1}: Acc={acc:.4f}, F1={f1:.4f}")
+
+        if acc > best_acc:
+            best_acc = acc
+            os.makedirs(args.output, exist_ok=True)
+            torch.save(model.state_dict(), os.path.join(args.output, 'best.pth'))
+
+    print(f"Training complete. Best Acc: {best_acc:.4f}")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 2: ЭКСПОРТ В ONNX
+# =============================================================================
+COPY <<'PYTHON' /workspace/02_export_onnx.py
+import os, time, torch
+import timm
+
+def main():
+    model_name = os.environ.get("MODEL_NAME", "resnet50")
+    num_classes = int(os.environ.get("NUM_CLASSES", "3"))
+    weights = os.environ.get("WEIGHTS", "/workspace/runs/timm/best.pth")
+    onnx_path = os.environ.get("ONNX_PATH", "/workspace/runs/onnx/model.onnx")
+
+    os.makedirs(os.path.dirname(onnx_path), exist_ok=True)
+
+    with open("/workspace/logs/03_export.log", "a") as f:
+        f.write(f"=== timm ONNX Export ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    model = timm.create_model(model_name, pretrained=False, num_classes=num_classes)
+    model.load_state_dict(torch.load(weights, map_location='cpu'))
+    model.eval()
+
+    dummy = torch.randn(1, 3, 224, 224)
+    torch.onnx.export(
+        model, dummy, onnx_path,
+        input_names=['input'],
+        output_names=['output'],
+        opset_version=13,
+        dynamic_axes={'input': {0: 'batch'}},
+    )
+
+    with open("/workspace/logs/03_export.log", "a") as f:
+        f.write(f"Exported: {onnx_path}\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# PIPELINE
+# =============================================================================
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "timm Pipeline START"
+CURRENT_STEP="0/4 CONVERT"; log "STEP 0/4: Converting LabelMe > class folders"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/4 TRAIN"; log "STEP 1/4: Training"
+python /workspace/01_train.py 2>&1 | tee -a /workspace/logs/01_train.log
+
+CURRENT_STEP="2/4 EXPORT"; log "STEP 2/4: Exporting ONNX"
+python /workspace/02_export_onnx.py 2>&1 | tee -a /workspace/logs/03_export.log
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

@@ -1,0 +1,238 @@
+# =============================================================================
+# cascade_rcnn_docker.dockerfile
+# Cascade R-CNN (MMDetection v2.27.0, Apache 2.0) — multi-stage детектор.
+#
+# АРХИТЕКТУРА:
+#   Stage 1: Backbone (ResNet) > FPN > RPNHead
+#   Stage 2: Каскад из 3 RoIHead с растущим IoU (0.5, 0.6, 0.7)
+#            каждый следующий уточняет bbox предыдущего.
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ:
+#   MMDetection 2.27.0 + mmcv-full 1.7.0 + torch 1.10.0 + cu113.
+#   mmdeploy 0.12.0 — для ONNX-экспорта.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+RUN git clone -b 'v2.27.0' https://github.com/open-mmlab/mmdetection.git . \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir pybind11 onnxruntime onnx onnxsim \
+    && git clone -b 'v0.12.0' https://github.com/open-mmlab/mmdeploy.git /workspace/mmdeploy \
+    && cd /workspace/mmdeploy && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    scikit-learn lxml \
+    pycocotools supervision \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmdetection/data /workspace/work_dirs /workspace/configs_generated
+
+# =============================================================================
+# ГЕНЕРАТОР КОНФИГА: Cascade R-CNN
+# =============================================================================
+COPY <<'PYTHON' /workspace/generate_config.py
+"""Cascade R-CNN config generator."""
+import argparse, os
+from pathlib import Path
+
+DETECTOR = "CascadeRCNN"
+
+
+def render_dict(d, indent=0):
+    pad = "    " * indent
+    lines = ["{"]
+    for k, v in d.items():
+        if isinstance(v, dict):
+            lines.append(f"{pad}    '{k}': {render_dict(v, indent + 1)},")
+        elif isinstance(v, (list, tuple)):
+            lines.append(f"{pad}    '{k}': {list(v)},")
+        else:
+            lines.append(f"{pad}    '{k}': {v!r},")
+    lines.append(f"{pad}}}")
+    return "\n".join(lines)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default=os.environ.get("CONFIG", ""))
+    p.add_argument("--num-classes", type=int, default=int(os.environ.get("NUM_CLASSES", "3")))
+    p.add_argument("--classes", nargs="+", default=os.environ.get("CLASSES", "class1 class2 class3").split())
+    p.add_argument("--epochs", type=int, default=int(os.environ.get("EPOCHS", "20")))
+    p.add_argument("--batch", type=int, default=int(os.environ.get("BATCH", "2")))
+    p.add_argument("--workers", type=int, default=int(os.environ.get("WORKERS", "2")))
+    p.add_argument("--img-size", type=int, default=int(os.environ.get("IMG_SIZE", "640")))
+    p.add_argument("--data-root", default=os.environ.get("DATA_ROOT", "/workspace/mmdetection/data/VOC2007"))
+    args = p.parse_args()
+
+    if args.config:
+        print(f"[INFO] CONFIG set, using: {args.config}")
+        print(args.config)
+        return
+
+    out_path = Path("/workspace/configs_generated/generated_config.py")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Три head'а с растущим IoU (0.5, 0.6, 0.7)
+    bbox_heads = []
+    for i, iou in enumerate([0.5, 0.6, 0.7]):
+        bbox_heads.append(f"""    dict(
+        type='Shared2FCBBoxHead',
+        in_channels=256, fc_out_channels=1024, roi_feat_size=7,
+        num_classes={args.num_classes},
+        bbox_coder=dict(type='DeltaXYWHBBoxCoder',
+                        target_means=[0., 0., 0., 0.],
+                        target_stds=[0.1, 0.1, 0.2, 0.2]),
+        reg_class_agnostic=True,
+        loss_cls=dict(type='CrossEntropyLoss', use_sigmoid=False, loss_weight=1.0),
+        loss_bbox=dict(type='SmoothL1Loss', beta=1.0, loss_weight=1.0))""")
+
+    bbox_heads_str = ",\n".join(bbox_heads)
+
+    config = f"""# Cascade R-CNN config
+dataset_type = 'CocoDataset'
+data_root = '{args.data_root}'
+classes = {list(args.classes)}
+
+img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+img_scale = ({args.img_size}, {args.img_size})
+
+model = dict(
+    type='{DETECTOR}',
+    backbone=dict(
+        type='ResNet', depth=50, num_stages=4, out_indices=(0, 1, 2, 3),
+        frozen_stages=1,
+        norm_cfg=dict(type='BN', requires_grad=True),
+        norm_eval=True, style='pytorch'),
+    neck=dict(
+        type='FPN', in_channels=[256, 512, 1024, 2048],
+        out_channels=256, num_outs=5),
+    rpn_head=dict(
+        type='RPNHead', in_channels=256, feat_channels=256,
+        anchor_generator=dict(type='AnchorGenerator', scales=[8],
+                              ratios=[0.5, 1.0, 2.0], strides=[4, 8, 16, 32, 64]),
+        bbox_coder=dict(type='DeltaXYWHBBoxCoder',
+                        target_means=[.0, .0, .0, .0],
+                        target_stds=[1.0, 1.0, 1.0, 1.0]),
+        loss_cls=dict(type='CrossEntropyLoss', use_sigmoid=True, loss_weight=1.0),
+        loss_bbox=dict(type='L1Loss', loss_weight=1.0)),
+    roi_head=dict(
+        type='CascadeRoIHead',
+        num_stages=3,
+        stage_loss_weights=[1, 0.5, 0.25],
+        bbox_roi_extractor=dict(
+            type='SingleRoIExtractor',
+            roi_layer=dict(type='RoIAlign', output_size=7, sampling_ratio=0),
+            out_channels=256, featmap_strides=[4, 8, 16, 32]),
+        bbox_head=[
+{bbox_heads_str}
+        ]),
+    train_cfg=dict(
+        rpn=dict(assigner=dict(type='MaxIoUAssigner', pos_iou_thr=0.7, neg_iou_thr=0.3,
+                               min_pos_iou=0.3, match_low_quality=True, ignore_iof_thr=-1),
+                 sampler=dict(type='RandomSampler', num=256, pos_fraction=0.5,
+                              neg_pos_ub=-1, add_gt_as_proposals=False),
+                 allowed_border=0, pos_weight=-1, debug=False),
+        rpn_proposal=dict(nms_pre=2000, max_per_img=2000,
+                          nms=dict(type='nms', iou_threshold=0.7), min_bbox_size=0),
+        rcnn=[
+            dict(assigner=dict(type='MaxIoUAssigner', pos_iou_thr=0.5, neg_iou_thr=0.5,
+                               min_pos_iou=0.5, match_low_quality=False, ignore_iof_thr=-1),
+                 sampler=dict(type='RandomSampler', num=512, pos_fraction=0.25,
+                              neg_pos_ub=-1, add_gt_as_proposals=True),
+                 pos_weight=-1, debug=False),
+            dict(assigner=dict(type='MaxIoUAssigner', pos_iou_thr=0.6, neg_iou_thr=0.6,
+                               min_pos_iou=0.6, match_low_quality=False, ignore_iof_thr=-1),
+                 sampler=dict(type='RandomSampler', num=512, pos_fraction=0.25,
+                              neg_pos_ub=-1, add_gt_as_proposals=True),
+                 pos_weight=-1, debug=False),
+            dict(assigner=dict(type='MaxIoUAssigner', pos_iou_thr=0.7, neg_iou_thr=0.7,
+                               min_pos_iou=0.7, match_low_quality=False, ignore_iof_thr=-1),
+                 sampler=dict(type='RandomSampler', num=512, pos_fraction=0.25,
+                              neg_pos_ub=-1, add_gt_as_proposals=True),
+                 pos_weight=-1, debug=False),
+        ]),
+    test_cfg=dict(
+        rpn=dict(nms_pre=1000, max_per_img=1000,
+                 nms=dict(type='nms', iou_threshold=0.7), min_bbox_size=0),
+        rcnn=dict(score_thr=0.05, nms=dict(type='nms', iou_threshold=0.5), max_per_img=100)),
+)
+
+train_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadAnnotations', with_bbox=True),
+    dict(type='Resize', img_scale=img_scale, keep_ratio=True),
+    dict(type='RandomFlip', flip_ratio=0.5),
+    dict(type='Normalize', **img_norm_cfg),
+    dict(type='Pad', size_divisor=32),
+    dict(type='DefaultFormatBundle'),
+    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels']),
+]
+
+test_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='MultiScaleFlipAug', img_scale=img_scale, flip=False, transforms=[
+        dict(type='Resize', keep_ratio=True),
+        dict(type='RandomFlip'),
+        dict(type='Normalize', **img_norm_cfg),
+        dict(type='Pad', size_divisor=32),
+        dict(type='ImageToTensor', keys=['img']),
+        dict(type='Collect', keys=['img']),
+    ]),
+]
+
+data = dict(
+    samples_per_gpu={args.batch},
+    workers_per_gpu={args.workers},
+    train=dict(type=dataset_type, classes=classes,
+               ann_file=f'{{data_root}}/annotations/trainval.json',
+               img_prefix=f'{{data_root}}/train/', pipeline=train_pipeline),
+    val=dict(type=dataset_type, classes=classes,
+             ann_file=f'{{data_root}}/annotations/test.json',
+             img_prefix=f'{{data_root}}/test/', pipeline=test_pipeline),
+    test=dict(type=dataset_type, classes=classes,
+              ann_file=f'{{data_root}}/annotations/test.json',
+              img_prefix=f'{{data_root}}/test/', pipeline=test_pipeline),
+)
+
+optimizer = dict(type='SGD', lr=0.02, momentum=0.9, weight_decay=0.0001)
+lr_config = dict(policy='step', warmup='linear', warmup_iters=500,
+                 warmup_ratio=0.001, step=[16, 19])
+runner = dict(type='EpochBasedRunner', max_epochs={args.epochs})
+evaluation = dict(interval=1, metric='bbox')
+checkpoint_config = dict(interval=1)
+log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
+"""
+
+    out_path.write_text(config)
+    print(f"[OK] Generated: {out_path}")
+    print(f"     DETECTOR = {DETECTOR} (3-stage cascade)")
+    return str(out_path)
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# Остальные скрипты (00_convert.py, 00b_voc_to_coco.sh, 01_train.sh, 02_test_pth.sh,
+# 03_export_onnx.sh, 04_test_onnx.py, 05_plots.py, pipeline.sh) — идентичны
+# Faster R-CNN контейнеру. Копируются без изменений.
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

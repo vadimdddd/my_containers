@@ -1,0 +1,246 @@
+# =============================================================================
+# lightonocr_docker.dockerfile
+# LightOnOCR-2-1B (Apache 2.0) — end-to-end OCR VLM.
+#
+# НАЗНАЧЕНИЕ:
+#   - Инференс на готовых весах (документы, сканы, таблицы).
+#   - LoRA/QLoRA файн-тюнинг на кастомных данных (адаптация под язык/домен).
+#
+# ВАЖНО:
+#   Это НЕ пайплайн "convert > train > test > export" в том же смысле,
+#   что для CRNN (MMOCR). LightOnOCR — это VLM, а не лёгкий распознаватель.
+#   Файн-тюнинг требует 24GB+ VRAM и делается через LoRA.
+#
+# ЛИЦЕНЗИЯ:
+#   Веса модели: Apache 2.0 [citation:1][citation:2][citation:7].
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Установка transformers из исходников (требуется для LightOnOcrForConditionalGeneration)
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir \
+    "transformers>=5.0.0" \
+    accelerate \
+    peft \
+    bitsandbytes \
+    datasets \
+    Pillow \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+# Установка зависимостей для генерации из исходников
+RUN pip install --no-cache-dir \
+    git+https://github.com/huggingface/transformers.git
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# ИНФЕРЕНС: LightOnOCR-2-1B
+# =============================================================================
+COPY <<'PYTHON' /workspace/inference.py
+"""
+Инференс LightOnOCR-2-1B на изображениях.
+"""
+import os, time, argparse
+import torch
+from transformers import LightOnOcrForConditionalGeneration, LightOnOcrProcessor
+from PIL import Image
+
+LONGEST_EDGE = 1540
+BASE_MODEL_ID = "lightonai/LightOnOCR-2-1B"
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--image", required=True, help="Path to image or PDF")
+    p.add_argument("--log", default="/workspace/logs/inference.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== LightOnOCR Inference ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    processor = LightOnOcrProcessor.from_pretrained(BASE_MODEL_ID)
+    processor.tokenizer.padding_side = "left"
+
+    model = LightOnOcrForConditionalGeneration.from_pretrained(
+        BASE_MODEL_ID,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    )
+    model.eval()
+
+    image = Image.open(args.image).convert("RGB")
+
+    messages = [
+        {"role": "user", "content": [{"type": "image"}]},
+    ]
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(
+        text=text,
+        images=[image],
+        return_tensors="pt",
+        size={"longest_edge": LONGEST_EDGE},
+    ).to(model.device)
+
+    with torch.no_grad():
+        generated_ids = model.generate(
+            **inputs,
+            max_new_tokens=4096,
+            do_sample=False,
+        )
+
+    result = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
+
+    with open(args.log, "a") as f:
+        f.write(f"Image: {args.image}\n")
+        f.write(f"Result:\n{result}\n")
+
+    print(result)
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# LoRA FINE-TUNING: LightOnOCR-2-1B
+# =============================================================================
+COPY <<'PYTHON' /workspace/finetune_lora.py
+"""
+LoRA fine-tuning LightOnOCR-2-1B на кастомных данных.
+
+ФОРМАТ ДАТАСЕТА:
+  datasets/
+    +-- train/
+    ¦   +-- image1.png
+    ¦   L-- image1.txt    # ground truth text
+    +-- valid/
+    ¦   +-- image1.png
+    ¦   L-- image1.txt
+    L-- ...
+
+ТРЕБОВАНИЯ:
+  - GPU с 24GB+ VRAM (RTX 3090/4090/A5000).
+  - QLoRA (4-bit) позволяет уложиться в ~8GB VRAM [citation:2].
+"""
+import os, time, argparse
+import torch
+from torch.utils.data import Dataset, DataLoader
+from transformers import LightOnOcrForConditionalGeneration, LightOnOcrProcessor
+from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from PIL import Image
+
+LONGEST_EDGE = 1540
+BASE_MODEL_ID = "lightonai/LightOnOCR-2-1B-base"
+
+class OCRDataset(Dataset):
+    def __init__(self, root_dir, processor):
+        self.samples = []
+        self.processor = processor
+        for fname in sorted(os.listdir(root_dir)):
+            if fname.endswith((".png", ".jpg", ".jpeg")):
+                img_path = os.path.join(root_dir, fname)
+                txt_path = os.path.splitext(img_path)[0] + ".txt"
+                if os.path.exists(txt_path):
+                    with open(txt_path, encoding="utf-8") as f:
+                        text = f.read().strip()
+                    self.samples.append((img_path, text))
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        img_path, text = self.samples[idx]
+        image = Image.open(img_path).convert("RGB")
+        messages = [
+            {"role": "user", "content": [{"type": "image"}]},
+            {"role": "assistant", "content": [{"type": "text", "text": text}]},
+        ]
+        prompt = self.processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=False
+        )
+        inputs = self.processor(
+            text=prompt,
+            images=[image],
+            return_tensors="pt",
+            size={"longest_edge": LONGEST_EDGE},
+        )
+        return {k: v.squeeze(0) for k, v in inputs.items()}
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--data", required=True, help="Root with train/ and valid/")
+    p.add_argument("--output", default="/workspace/runs/lora_adapter")
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--batch", type=int, default=1)
+    p.add_argument("--lr", type=float, default=5e-5)
+    p.add_argument("--log", default="/workspace/logs/finetune.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== LightOnOCR LoRA Fine-tuning ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    processor = LightOnOcrProcessor.from_pretrained(BASE_MODEL_ID)
+    processor.tokenizer.padding_side = "left"
+
+    model = LightOnOcrForConditionalGeneration.from_pretrained(
+        BASE_MODEL_ID,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    )
+
+    # LoRA конфигурация (из рекомендаций сообщества) [citation:8][citation:20]
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        target_modules=["q_proj", "v_proj", "k_proj", "o_proj"],
+        lora_dropout=0.1,
+        bias="none",
+        task_type="CAUSAL_LM",
+    )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
+
+    train_dataset = OCRDataset(os.path.join(args.data, "train"), processor)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
+
+    model.train()
+    for epoch in range(args.epochs):
+        total_loss = 0
+        for batch in train_loader:
+            batch = {k: v.to(model.device) for k, v in batch.items()}
+            outputs = model(**batch)
+            loss = outputs.loss
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+            total_loss += loss.item()
+
+        avg_loss = total_loss / len(train_loader)
+        with open(args.log, "a") as f:
+            f.write(f"Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.4f}\n")
+        print(f"Epoch {epoch + 1}/{args.epochs}, Loss: {avg_loss:.4f}")
+
+    model.save_pretrained(args.output)
+    processor.save_pretrained(args.output)
+
+    with open(args.log, "a") as f:
+        f.write(f"LoRA adapter saved to {args.output}\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

@@ -1,0 +1,217 @@
+# =============================================================================
+# mmpose_docker.dockerfile
+# MMPose v0.29.0 (Apache 2.0) Ч модульный pose estimation.
+#
+# Ќј«Ќј„≈Ќ»≈:
+#   - 2D body pose (COCO 17 keypoints).
+#   - Face, hand, animal keypoints.
+#   - Top-down и bottom-up пайплайны.
+#
+# —ќ¬ћ≈—“»ћќ—“№ ¬≈–—»…:
+#   MMPose 0.29.0 требует mmcv-full>=1.3.8,<1.7.0 [citation:6]
+#   »спользуем mmcv-full 1.7.0 дл€ совместимости с mmdet [citation:2]
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+# MMPose 0.29.0
+RUN git clone -b 'v0.29.0' https://github.com/open-mmlab/mmpose.git . \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -v -e .
+
+# xtcocotools (часта€ проблема при установке) [citation:6]
+RUN pip install --no-cache-dir xtcocotools
+
+RUN pip install --no-cache-dir \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    tqdm
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmpose/data /workspace/work_dirs
+
+# =============================================================================
+# —“јƒ»я 0:  ќЌ¬≈–“ј÷»я ƒј“ј—≈“ј
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""
+LabelMe JSON > COCO format дл€ MMPose.
+
+‘ќ–ћј“ COCO Keypoints:
+  annotations[].keypoints = [x1, y1, v1, x2, y2, v2, ...]
+  где v = 0 (не размечено), 1 (размечено, не видно), 2 (видимо)
+"""
+import os, sys, glob, json, shutil
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+OUT_DIR = os.environ.get("MMPOSE_DATA_DIR", "/workspace/mmpose/data/custom_pose")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.2"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+NUM_KEYPOINTS = int(os.environ.get("NUM_KEYPOINTS", "17"))
+
+def convert_to_coco(json_files, label_list, out_path, img_dir):
+    images, annotations = [], []
+    ann_id = 0
+    img_id = 0
+
+    for jp in json_files:
+        base = os.path.splitext(os.path.basename(jp))[0]
+        src_dir = os.path.dirname(jp)
+        jpg = os.path.join(src_dir, base + '.jpg')
+        if not os.path.exists(jpg):
+            continue
+
+        img_out = os.path.join(img_dir, base + '.jpg')
+        shutil.copy2(jpg, img_out)
+        img = cv2.imread(img_out)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        images.append({"id": img_id, "file_name": base + '.jpg',
+                       "width": w, "height": h})
+
+        with open(jp, encoding='utf-8') as f:
+            data = json.load(f)
+
+        for shape in data.get('shapes', []):
+            if shape['label'] not in label_list:
+                continue
+            # ƒл€ keypoints: shape должен быть точкой (point), не полигоном
+            pts = shape['points']
+            if len(pts) != NUM_KEYPOINTS:
+                continue
+
+            # keypoints формат: [x1, y1, v1, x2, y2, v2, ...]
+            kpts_flat = []
+            for pt in pts:
+                kpts_flat.extend([pt[0], pt[1], 2])  # v=2 (visible)
+
+            # bbox вокруг всех keypoints
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x_min, y_min = max(0, min(xs)), max(0, min(ys))
+            x_max, y_max = min(w, max(xs)), min(h, max(ys))
+            bw, bh = x_max - x_min, y_max - y_min
+
+            annotations.append({
+                "id": ann_id,
+                "image_id": img_id,
+                "category_id": 1,  # person
+                "keypoints": kpts_flat,
+                "num_keypoints": NUM_KEYPOINTS,
+                "bbox": [int(x_min), int(y_min), int(bw), int(bh)],
+                "area": int(bw * bh),
+                "iscrowd": 0,
+            })
+            ann_id += 1
+        img_id += 1
+
+    categories = [{"id": 1, "name": "person",
+                   "keypoints": [f"kp_{i}" for i in range(NUM_KEYPOINTS)],
+                   "skeleton": []}]
+    coco = {"images": images, "annotations": annotations, "categories": categories}
+    with open(out_path, 'w') as f:
+        json.dump(coco, f)
+    print(f"[OK] {out_path}: {len(images)} images, {len(annotations)} annotations")
+
+def main():
+    for sub in ['train', 'val']:
+        os.makedirs(os.path.join(OUT_DIR, 'images', sub), exist_ok=True)
+        os.makedirs(os.path.join(OUT_DIR, 'annotations'), exist_ok=True)
+
+    obj_path = os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)
+    with open(obj_path) as f:
+        LABEL_LIST = [l.strip() for l in f if l.strip()]
+
+    all_json = []
+    for dp, dn, fn in os.walk(DATASETS_DIR):
+        all_json.extend(sorted(glob.glob(os.path.join(dp, '*.json'))))
+
+    train_json, val_json = train_test_split(all_json, test_size=SPLIT_SIZE,
+                                              random_state=RANDOM_STATE)
+
+    convert_to_coco(train_json, LABEL_LIST,
+                    os.path.join(OUT_DIR, 'annotations', 'train.json'),
+                    os.path.join(OUT_DIR, 'images', 'train'))
+    convert_to_coco(val_json, LABEL_LIST,
+                    os.path.join(OUT_DIR, 'annotations', 'val.json'),
+                    os.path.join(OUT_DIR, 'images', 'val'))
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# —“јƒ»я 1: “–≈Ќ»–ќ¬ ј
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== MMPose Training ==="
+echo "Timestamp: $(date)"
+echo "Config: ${CONFIG:-configs/body_2d_keypoint/topdown_heatmap/coco/td-hm_hrnet-w32_8xb64-210e_coco-256x192.py}"
+echo "---"
+
+cd /workspace/mmpose
+python tools/train.py ${CONFIG} --work-dir /workspace/work_dirs/${RUN_NAME:-mmpose}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/02_test.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test.log}
+{
+echo "=== MMPose Test ==="
+cd /workspace/mmpose
+python tools/test.py ${CONFIG} ${CHECKPOINT} --eval mAP
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test.sh
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "MMPose Pipeline START"
+CURRENT_STEP="0/3 CONVERT"; log "STEP 0/3: Converting LabelMe > COCO Keypoints"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/3 TRAIN"; log "STEP 1/3: Training"
+bash /workspace/01_train.sh
+
+CURRENT_STEP="2/3 TEST"; log "STEP 2/3: Testing"
+bash /workspace/02_test.sh
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

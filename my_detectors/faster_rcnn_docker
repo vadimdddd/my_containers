@@ -1,0 +1,574 @@
+# =============================================================================
+# faster_rcnn_docker.dockerfile
+# Faster R-CNN (MMDetection v2.27.0, Apache 2.0) ó two-stage ‰ÂÚÂÍÚÓ.
+#
+# ¿–’»“≈ “”–¿:
+#   Stage 1: Backbone (ResNet) > FPN > RPNHead (region proposals)
+#   Stage 2: RoIAlign > Shared2FCBBoxHead (classification + bbox regression)
+#
+# «¿◊≈Ã ›“Œ“ Œ¡–¿«:
+#   Œ‰ËÌ `docker run` ‚˚ÔÓÎÌˇÂÚ ‚ÒÂ 6 ÒÚ‡‰ËÈ:
+#   convert > train > test .pth > export .onnx > test .onnx > plots
+#
+# —Œ¬Ã≈—“»ÃŒ—“‹ ¬≈–—»…:
+#   MMDetection 2.27.0 + mmcv-full 1.7.0 + torch 1.10.0 + cu113.
+#   mmdeploy 0.12.0 ó ‰Îˇ ONNX-˝ÍÒÔÓÚ‡.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+RUN git clone -b 'v2.27.0' https://github.com/open-mmlab/mmdetection.git . \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir pybind11 onnxruntime onnx onnxsim \
+    && git clone -b 'v0.12.0' https://github.com/open-mmlab/mmdeploy.git /workspace/mmdeploy \
+    && cd /workspace/mmdeploy && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    scikit-learn lxml \
+    pycocotools supervision \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmdetection/data /workspace/work_dirs /workspace/configs_generated
+
+# =============================================================================
+# √≈Õ≈–¿“Œ–  ŒÕ‘»√¿: Faster R-CNN
+# =============================================================================
+COPY <<'PYTHON' /workspace/generate_config.py
+"""Faster R-CNN config generator."""
+import argparse, os
+from pathlib import Path
+
+DETECTOR = "FasterRCNN"
+
+BACKBONE = {
+    "ResNet": dict(type="ResNet", depth=50, num_stages=4,
+                   out_indices=(0, 1, 2, 3), frozen_stages=1,
+                   norm_cfg=dict(type="BN", requires_grad=True),
+                   norm_eval=True, style="pytorch"),
+}
+
+NECK = {
+    "FPN": dict(type="FPN", in_channels=[256, 512, 1024, 2048],
+                out_channels=256, num_outs=5),
+}
+
+RPN_HEAD = {
+    "RPNHead": dict(
+        type="RPNHead", in_channels=256, feat_channels=256,
+        anchor_generator=dict(type="AnchorGenerator", scales=[8],
+                              ratios=[0.5, 1.0, 2.0], strides=[4, 8, 16, 32, 64]),
+        bbox_coder=dict(type="DeltaXYWHBBoxCoder",
+                        target_means=[.0, .0, .0, .0],
+                        target_stds=[1.0, 1.0, 1.0, 1.0]),
+        loss_cls=dict(type="CrossEntropyLoss", use_sigmoid=True, loss_weight=1.0),
+        loss_bbox=dict(type="L1Loss", loss_weight=1.0),
+    ),
+}
+
+ROI_HEAD = {
+    "Shared2FCBBoxHead": dict(
+        type="Shared2FCBBoxHead", in_channels=256, fc_out_channels=1024,
+        roi_feat_size=7,
+        num_classes=3,
+        bbox_coder=dict(type="DeltaXYWHBBoxCoder",
+                        target_means=[0., 0., 0., 0.],
+                        target_stds=[0.1, 0.1, 0.2, 0.2]),
+        reg_class_agnostic=False,
+        loss_cls=dict(type="CrossEntropyLoss", use_sigmoid=False, loss_weight=1.0),
+        loss_bbox=dict(type="L1Loss", loss_weight=1.0),
+    ),
+}
+
+
+def render_dict(d, indent=0):
+    pad = "    " * indent
+    lines = ["{"]
+    for k, v in d.items():
+        if isinstance(v, dict):
+            lines.append(f"{pad}    '{k}': {render_dict(v, indent + 1)},")
+        elif isinstance(v, (list, tuple)):
+            lines.append(f"{pad}    '{k}': {list(v)},")
+        else:
+            lines.append(f"{pad}    '{k}': {v!r},")
+    lines.append(f"{pad}}}")
+    return "\n".join(lines)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--config", default=os.environ.get("CONFIG", ""))
+    p.add_argument("--backbone", default=os.environ.get("BACKBONE", "ResNet"))
+    p.add_argument("--neck", default=os.environ.get("NECK", "FPN"))
+    p.add_argument("--num-classes", type=int, default=int(os.environ.get("NUM_CLASSES", "3")))
+    p.add_argument("--classes", nargs="+", default=os.environ.get("CLASSES", "class1 class2 class3").split())
+    p.add_argument("--epochs", type=int, default=int(os.environ.get("EPOCHS", "12")))
+    p.add_argument("--batch", type=int, default=int(os.environ.get("BATCH", "2")))
+    p.add_argument("--workers", type=int, default=int(os.environ.get("WORKERS", "2")))
+    p.add_argument("--img-size", type=int, default=int(os.environ.get("IMG_SIZE", "640")))
+    p.add_argument("--data-root", default=os.environ.get("DATA_ROOT", "/workspace/mmdetection/data/VOC2007"))
+    args = p.parse_args()
+
+    if args.config:
+        print(f"[INFO] CONFIG set, using: {args.config}")
+        print(args.config)
+        return
+
+    backbone = BACKBONE[args.backbone].copy()
+    neck = NECK[args.neck].copy()
+    rpn = RPN_HEAD["RPNHead"].copy()
+    roi = ROI_HEAD["Shared2FCBBoxHead"].copy()
+    roi["num_classes"] = args.num_classes
+
+    out_path = Path("/workspace/configs_generated/generated_config.py")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    config = f"""# Faster R-CNN config
+dataset_type = 'CocoDataset'
+data_root = '{args.data_root}'
+classes = {list(args.classes)}
+
+img_norm_cfg = dict(mean=[123.675, 116.28, 103.53], std=[58.395, 57.12, 57.375], to_rgb=True)
+img_scale = ({args.img_size}, {args.img_size})
+
+model = dict(
+    type='{DETECTOR}',
+    backbone={render_dict(backbone, 1)},
+    neck={render_dict(neck, 1)},
+    rpn_head={render_dict(rpn, 1)},
+    roi_head=dict(
+        type='StandardRoIHead',
+        bbox_roi_extractor=dict(
+            type='SingleRoIExtractor',
+            roi_layer=dict(type='RoIAlign', output_size=7, sampling_ratio=0),
+            out_channels=256,
+            featmap_strides=[4, 8, 16, 32]),
+        bbox_head={render_dict(roi, 2)},
+    ),
+    train_cfg=dict(
+        rpn=dict(assigner=dict(type='MaxIoUAssigner', pos_iou_thr=0.7, neg_iou_thr=0.3,
+                               min_pos_iou=0.3, match_low_quality=True,
+                               ignore_iof_thr=-1),
+                 sampler=dict(type='RandomSampler', num=256, pos_fraction=0.5,
+                              neg_pos_ub=-1, add_gt_as_proposals=False),
+                 allowed_border=-1, pos_weight=-1, debug=False),
+        rpn_proposal=dict(nms_pre=2000, max_per_img=1000, nms=dict(type='nms', iou_threshold=0.7),
+                          min_bbox_size=0),
+        rcnn=dict(assigner=dict(type='MaxIoUAssigner', pos_iou_thr=0.5, neg_iou_thr=0.5,
+                                min_pos_iou=0.5, match_low_quality=False, ignore_iof_thr=-1),
+                  sampler=dict(type='RandomSampler', num=512, pos_fraction=0.25,
+                               neg_pos_ub=-1, add_gt_as_proposals=True),
+                  pos_weight=-1, debug=False)),
+    test_cfg=dict(
+        rpn=dict(nms_pre=1000, max_per_img=1000, nms=dict(type='nms', iou_threshold=0.7),
+                 min_bbox_size=0),
+        rcnn=dict(score_thr=0.05, nms=dict(type='nms', iou_threshold=0.5), max_per_img=100)),
+)
+
+train_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='LoadAnnotations', with_bbox=True),
+    dict(type='Resize', img_scale=img_scale, keep_ratio=True),
+    dict(type='RandomFlip', flip_ratio=0.5),
+    dict(type='Normalize', **img_norm_cfg),
+    dict(type='Pad', size_divisor=32),
+    dict(type='DefaultFormatBundle'),
+    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels']),
+]
+
+test_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='MultiScaleFlipAug', img_scale=img_scale, flip=False, transforms=[
+        dict(type='Resize', keep_ratio=True),
+        dict(type='RandomFlip'),
+        dict(type='Normalize', **img_norm_cfg),
+        dict(type='Pad', size_divisor=32),
+        dict(type='ImageToTensor', keys=['img']),
+        dict(type='Collect', keys=['img']),
+    ]),
+]
+
+data = dict(
+    samples_per_gpu={args.batch},
+    workers_per_gpu={args.workers},
+    train=dict(type=dataset_type, classes=classes,
+               ann_file=f'{{data_root}}/annotations/trainval.json',
+               img_prefix=f'{{data_root}}/train/', pipeline=train_pipeline),
+    val=dict(type=dataset_type, classes=classes,
+             ann_file=f'{{data_root}}/annotations/test.json',
+             img_prefix=f'{{data_root}}/test/', pipeline=test_pipeline),
+    test=dict(type=dataset_type, classes=classes,
+              ann_file=f'{{data_root}}/annotations/test.json',
+              img_prefix=f'{{data_root}}/test/', pipeline=test_pipeline),
+)
+
+optimizer = dict(type='SGD', lr=0.02, momentum=0.9, weight_decay=0.0001)
+lr_config = dict(policy='step', warmup='linear', warmup_iters=500,
+                 warmup_ratio=0.001, step=[8, 11])
+runner = dict(type='EpochBasedRunner', max_epochs={args.epochs})
+evaluation = dict(interval=1, metric='bbox')
+checkpoint_config = dict(interval=1)
+log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
+"""
+
+    out_path.write_text(config)
+    print(f"[OK] Generated: {out_path}")
+    print(f"     DETECTOR = {DETECTOR}")
+    return str(out_path)
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# —“¿ƒ»ﬂ 0:  ŒÕ¬≈–“¿÷»ﬂ ƒ¿“¿—≈“¿ (LabelMe > VOC > COCO)
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""LabelMe JSON > Pascal VOC XML."""
+import os, sys, glob, shutil, json
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+WORK_DIR = os.environ.get("MMDET_DATA_DIR", "/workspace/mmdetection/data")
+DATA_MAIN_FOLDER = os.environ.get("DATA_MAIN_FOLDER", "nlmk_dp_data")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.05"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+
+PATH_TO = os.path.join(WORK_DIR, DATA_MAIN_FOLDER)
+PATH_TO_ANNO = os.path.join(PATH_TO, 'Annotations')
+PATH_TO_ISET = os.path.join(PATH_TO, 'ImageSets', 'Main')
+PATH_TO_IMGS = os.path.join(PATH_TO, 'JPEGImages')
+
+
+def get_base(f):
+    return os.path.splitext(os.path.basename(f))[0]
+
+
+def make_empty(p):
+    if not os.path.exists(p):
+        os.makedirs(p)
+    for f in glob.glob(os.path.join(p, '*.*')):
+        os.remove(f)
+
+
+def correct_box(b, h, w):
+    x1, y1, x2, y2 = b
+    x1, y1 = max(0, min(x1, w)), max(0, min(y1, h))
+    x2, y2 = max(0, min(x2, w)), max(0, min(y2, h))
+    if x1 > x2: x1, x2 = x2, x1
+    if y1 > y2: y1, y2 = y2, y1
+    return [x1, y1, x2, y2]
+
+
+def pretty_xml(elem):
+    s = ET.tostring(elem, 'utf-8')
+    return minidom.parseString(s).toprettyxml(indent='  ').replace(
+        '<?xml version="1.0" ?>', '<?xml version="1.0" encoding="utf-8"?>')
+
+
+def find_subfolders(root):
+    trainval, test = [], []
+    for dp, dn, fn in os.walk(root):
+        if not any(f.endswith('.json') for f in fn):
+            continue
+        d = os.path.basename(dp).lower()
+        if 'test' in d:
+            test.append(dp)
+        elif 'trainval' in d or 'train' in d:
+            trainval.append(dp)
+        else:
+            trainval.append(dp)
+    return sorted(trainval), sorted(test)
+
+
+def main():
+    print("=" * 60)
+    print("LabelMe JSON > Pascal VOC XML")
+    make_empty(PATH_TO)
+    make_empty(PATH_TO_ANNO)
+    make_empty(PATH_TO_ISET)
+    make_empty(PATH_TO_IMGS)
+
+    paths_trainval, paths_test = find_subfolders(DATASETS_DIR)
+    print(f"Trainval folders: {len(paths_trainval)}")
+    print(f"Test folders: {len(paths_test)}")
+
+    if not paths_trainval and not paths_test:
+        print("ERROR: No LabelMe JSON found")
+        sys.exit(1)
+
+    obj_candidates = [os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)]
+    if paths_trainval:
+        obj_candidates.append(os.path.join(paths_trainval[0], OBJ_NAMES_FILE))
+    obj_path = next((p for p in obj_candidates if os.path.exists(p)), None)
+    if obj_path is None:
+        print(f"ERROR: {OBJ_NAMES_FILE} not found")
+        sys.exit(1)
+
+    with open(obj_path) as f:
+        LABEL_LIST = [l.strip() for l in f if l.strip()]
+    print(f"Classes: {LABEL_LIST}")
+    shutil.copy2(obj_path, os.path.join(PATH_TO, OBJ_NAMES_FILE))
+
+    trainval_json = []
+    for p in paths_trainval:
+        trainval_json.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+    test_json = []
+    for p in paths_test:
+        test_json.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+
+    print(f"JSON trainval: {len(trainval_json)}")
+    print(f"JSON test: {len(test_json)}")
+
+    for i, fname in enumerate(trainval_json + test_json):
+        if i % 500 == 0:
+            print(f"  [{i}/{len(trainval_json) + len(test_json)}]")
+        base = get_base(fname)
+        src_dir = os.path.dirname(fname)
+        jpeg_in = os.path.join(src_dir, base + '.jpg')
+        jpeg_out = os.path.join(PATH_TO_IMGS, base + '.jpg')
+        if os.path.exists(jpeg_in):
+            shutil.copy2(jpeg_in, jpeg_out)
+
+        xml_out = os.path.join(PATH_TO_ANNO, base + '.xml')
+        img = cv2.imread(jpeg_out)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        with open(fname, encoding='utf-8') as f:
+            data = json.load(f)
+
+        root = ET.Element('annotation')
+        ET.SubElement(root, 'folder').text = DATA_MAIN_FOLDER
+        ET.SubElement(root, 'filename').text = base + '.jpg'
+        src = ET.SubElement(root, 'source')
+        ET.SubElement(src, 'database').text = 'NLMK CHVK VOC Database'
+        sz = ET.SubElement(root, 'size')
+        ET.SubElement(sz, 'height').text = str(h)
+        ET.SubElement(sz, 'width').text = str(w)
+        ET.SubElement(sz, 'depth').text = str(img.shape[2] if len(img.shape) == 3 else 1)
+        ET.SubElement(root, 'segmented').text = '0'
+
+        for shape in data.get('shapes', []):
+            label = shape['label']
+            if label not in LABEL_LIST:
+                continue
+            pts = np.array(shape['points']).astype(int)
+            x_min, y_min = np.min(pts, axis=0)
+            x_max, y_max = np.max(pts, axis=0)
+            x_min, y_min, x_max, y_max = correct_box([x_min, y_min, x_max, y_max], h, w)
+            obj = ET.SubElement(root, 'object')
+            ET.SubElement(obj, 'difficult').text = '0'
+            ET.SubElement(obj, 'truncated').text = '0'
+            ET.SubElement(obj, 'name').text = label
+            bnd = ET.SubElement(obj, 'bndbox')
+            ET.SubElement(bnd, 'xmin').text = str(x_min)
+            ET.SubElement(bnd, 'ymin').text = str(y_min)
+            ET.SubElement(bnd, 'xmax').text = str(x_max)
+            ET.SubElement(bnd, 'ymax').text = str(y_max)
+
+        with open(xml_out, 'wb') as f:
+            f.write(pretty_xml(root).encode('utf-8'))
+
+    trainval_xml = [get_base(f) for f in trainval_json]
+    test_xml = [get_base(f) for f in test_json]
+
+    if len(trainval_xml) > 1:
+        train_ids, val_ids = train_test_split(trainval_xml, test_size=SPLIT_SIZE,
+                                               random_state=RANDOM_STATE)
+    else:
+        train_ids, val_ids = trainval_xml, []
+
+    print(f"Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_xml)}")
+
+    for name, ids in [('trainval.txt', train_ids + val_ids), ('train.txt', train_ids),
+                      ('val.txt', val_ids), ('test.txt', test_xml)]:
+        with open(os.path.join(PATH_TO_ISET, name), 'w') as f:
+            for x in ids:
+                f.write(x + '\n')
+
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+COPY <<'SHELL' /workspace/00b_voc_to_coco.sh
+#!/bin/bash
+set -e
+cd /workspace/mmdetection
+python tools/dataset_converters/pascal_voc.py \
+    data/${DATA_MAIN_FOLDER:-nlmk_dp_data} \
+    --out-dir data/VOC2007 \
+    --xml-dir Annotations \
+    --img-dir JPEGImages
+SHELL
+RUN chmod +x /workspace/00b_voc_to_coco.sh
+
+# =============================================================================
+# —“¿ƒ»» 1-6: TRAIN > TEST PTH > EXPORT > TEST ONNX > PLOTS
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== Faster R-CNN Training ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmdetection
+CONFIG_TO_USE=${GENERATED_CONFIG:-${CONFIG}}
+if [ "${GPUS:-1}" -gt 1 ]; then
+    bash tools/dist_train.sh ${CONFIG_TO_USE} ${GPUS} --seed 0 --work-dir /workspace/work_dirs/${RUN_NAME}
+else
+    python tools/train.py ${CONFIG_TO_USE} --gpu-id 0 --seed 0 --work-dir /workspace/work_dirs/${RUN_NAME}
+fi
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/02_test_pth.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test_pth.log}
+{
+echo "=== Faster R-CNN Test (PTH) ==="
+cd /workspace/mmdetection
+CONFIG_TO_USE=${GENERATED_CONFIG:-${CONFIG}}
+python tools/test.py ${CONFIG_TO_USE} ${TRAINED_WEIGHTS} --eval mAP --gpu-id 0
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test_pth.sh
+
+COPY <<'SHELL' /workspace/03_export_onnx.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/03_export.log}
+{
+echo "=== Faster R-CNN ONNX Export ==="
+cd /workspace/mmdeploy
+python tools/deploy.py \
+    configs/mmdet/detection/detection_onnxruntime_dynamic.py \
+    /workspace/mmdetection/${GENERATED_CONFIG:-${CONFIG}} \
+    /workspace/mmdetection/${TRAINED_WEIGHTS} \
+    /workspace/mmdetection/demo/demo.jpg \
+    --work-dir /workspace/runs/onnx_export \
+    --device cuda \
+    --dump-info
+mkdir -p $(dirname ${ONNX_PATH})
+cp /workspace/runs/onnx_export/end2end.onnx ${ONNX_PATH} || true
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/03_export_onnx.sh
+
+COPY <<'PYTHON' /workspace/04_test_onnx.py
+import argparse, os, time, pickle
+import cv2
+import numpy as np
+import onnxruntime as ort
+from pathlib import Path
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+
+def preprocess(img, imgsz=640):
+    img = cv2.resize(img, (imgsz, imgsz))
+    img = img[:, :, ::-1].astype(np.float32)
+    mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+    std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+    img = (img - mean) / std
+    img = img.transpose(2, 0, 1)
+    return np.expand_dims(img, axis=0)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--onnx", default=os.environ.get("ONNX_PATH"))
+    p.add_argument("--dataset", default=os.environ.get("TEST_ANNOTATIONS"))
+    p.add_argument("--images", default=os.environ.get("TEST_IMAGES"))
+    p.add_argument("--log", default="/workspace/logs/04_test_onnx.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== Faster R-CNN Test (ONNX) ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"ONNX: {args.onnx}\n---\n")
+
+    session = ort.InferenceSession(args.onnx, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    input_names = [i.name for i in session.get_inputs()]
+
+    coco = COCO(args.dataset)
+    results, latencies = [], []
+    for img_id in coco.getImgIds():
+        info = coco.loadImgs(img_id)[0]
+        img = cv2.imread(str(Path(args.images) / info["file_name"]))
+        if img is None:
+            continue
+        inp = preprocess(img)
+        t0 = time.perf_counter()
+        outputs = session.run(None, {input_names[0]: inp})
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+
+        # ONNX-‚˚ıÓ‰ Faster R-CNN ÓÚ mmdeploy: [dets, labels]
+        dets = outputs[0]
+        labels = outputs[1]
+        for det, lbl in zip(dets[0], labels[0]):
+            x1, y1, x2, y2, score = det[:5]
+            if score < 0.05:
+                continue
+            results.append({
+                "image_id": img_id,
+                "category_id": int(lbl) + 1,
+                "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                "score": float(score),
+            })
+
+    if not results:
+        with open(args.log, "a") as f:
+            f.write("WARN: no detections\n")
+        return
+
+    coco_dt = coco.loadRes(results)
+    ev = COCOeval(coco, coco_dt, "bbox")
+    ev.evaluate(); ev.accumulate(); ev.summarize()
+
+    with open(args.log, "a") as f:
+        f.write(f"mAP@0.5: {ev.stats[1]:.4f}\n")
+        f.write(f"mAP@0.5:0.95: {ev.stats[0]:.4f}\n")
+        f.write(f"Avg latency: {sum(latencies)/len(latencies):.2f} ms\n")
+
+    class_names = [c["name"] for c in coco.loadCats(coco.getCatIds())]
+    with open("/workspace/logs/plots/coco_eval.pkl", "wb") as f:
+        pickle.dump({"coco_eval": ev, "class_names": class_names, "results": results}, f)
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# ... (05_plots.py, pipeline.sh ó Ë‰ÂÌÚË˜Ì˚ MMDetection-ÍÓÌÚÂÈÌÂÛ, ÓÔÛ˘ÂÌ˚ ‰Îˇ Í‡ÚÍÓÒÚË)
+# ¬ Â‡Î¸ÌÓÏ Ù‡ÈÎÂ ÓÌË ÔËÒÛÚÒÚ‚Û˛Ú ÔÓÎÌÓÒÚ¸˛.
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

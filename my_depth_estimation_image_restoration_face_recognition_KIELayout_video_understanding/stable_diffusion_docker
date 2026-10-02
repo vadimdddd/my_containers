@@ -1,0 +1,114 @@
+# =============================================================================
+# stable_diffusion_docker.dockerfile
+# Stable Diffusion XL (CreativeML Open RAIL++-M) Ч text-to-image.
+#
+# „“ќ Ё“ќ:
+#   SDXL Ч latent diffusion model от Stability AI.
+#   —ама€ кастомизируема€ open-source модель: LoRA, ControlNet, Inpainting.
+#
+# Ћ»÷≈Ќ«»я:
+#   CreativeML Open RAIL++-M Ч коммерчески разрешена с ограничени€ми
+#   (запрещено генерировать незаконный/вредоносный контент).
+#
+# ¬ј–»јЌ“џ:
+#   SDXL base (stabilityai/stable-diffusion-xl-base-1.0)
+#   SDXL refiner (stabilityai/stable-diffusion-xl-refiner-1.0)
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir \
+    diffusers \
+    transformers \
+    accelerate \
+    safetensors \
+    invisible_watermark \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    Pillow
+
+RUN mkdir -p /workspace/runs /workspace/logs
+
+# =============================================================================
+# TEXT-TO-IMAGE (base + refiner ensemble)
+# =============================================================================
+COPY <<'PYTHON' /workspace/generate.py
+"""
+SDXL generation: base + refiner ensemble of experts.
+"""
+import os, time, argparse
+import torch
+from diffusers import DiffusionPipeline
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--negative", default="blurry, low quality, distorted")
+    p.add_argument("--steps", type=int, default=40)
+    p.add_argument("--high-noise-frac", type=float, default=0.8)
+    p.add_argument("--output", default="/workspace/runs/sdxl_output.png")
+    p.add_argument("--log", default="/workspace/logs/sdxl.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== SDXL Generation ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Prompt: {args.prompt}\n")
+
+    base = DiffusionPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-xl-base-1.0",
+        torch_dtype=torch.float16,
+        variant="fp16",
+        use_safetensors=True,
+    ).to("cuda")
+
+    refiner = DiffusionPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-xl-refiner-1.0",
+        text_encoder_2=base.text_encoder_2,
+        vae=base.vae,
+        torch_dtype=torch.float16,
+        variant="fp16",
+        use_safetensors=True,
+    ).to("cuda")
+
+    t0 = time.perf_counter()
+    latent = base(
+        prompt=args.prompt,
+        negative_prompt=args.negative,
+        num_inference_steps=args.steps,
+        denoising_end=args.high_noise_frac,
+        output_type="latent",
+    ).images
+
+    image = refiner(
+        prompt=args.prompt,
+        negative_prompt=args.negative,
+        num_inference_steps=args.steps,
+        denoising_start=args.high_noise_frac,
+        image=latent,
+    ).images[0]
+    latency = (time.perf_counter() - t0) * 1000
+
+    image.save(args.output)
+
+    with open(args.log, "a") as f:
+        f.write(f"Latency: {latency:.2f} ms\n")
+
+    print(f"Generated: {args.output} ({latency:.2f} ms)")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

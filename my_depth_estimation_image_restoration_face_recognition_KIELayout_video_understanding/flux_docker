@@ -1,0 +1,158 @@
+# =============================================================================
+# flux_docker.dockerfile
+# FLUX.2 [klein] 4B (Apache 2.0) Ч text-to-image + image editing.
+#
+# „“ќ Ё“ќ:
+#   FLUX.2 [klein] 4B Ч сама€ быстра€ и компактна€ модель из семейства FLUX.
+#   4B параметров, rectified flow transformer.
+#   √енераци€ + редактирование в одной архитектуре.
+#
+# –≈«”Ћ№“ј“џ:
+#   Sub-second inference (~0.3s на GB200, ~1.2s на RTX 5090)
+#   VRAM: 8.4 GB
+#
+# Ћ»÷≈Ќ«»я:
+#   Apache 2.0 Ч коммерчески чиста€, включа€ выходные изображени€.
+#   ¬ј∆Ќќ: FLUX.2 [klein] 9B и FLUX.1 [dev] Ч Non-Commercial License.
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# Diffusers из исходников (требуетс€ дл€ Flux2KleinPipeline)
+RUN pip install --no-cache-dir \
+    git+https://github.com/huggingface/diffusers.git \
+    transformers \
+    accelerate \
+    safetensors \
+    sentencepiece \
+    protobuf \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    Pillow
+
+RUN mkdir -p /workspace/images /workspace/runs /workspace/logs
+
+# =============================================================================
+# TEXT-TO-IMAGE GENERATION
+# =============================================================================
+COPY <<'PYTHON' /workspace/generate.py
+"""
+FLUX.2 [klein] 4B text-to-image generation.
+"""
+import os, time, argparse
+import torch
+from diffusers import Flux2KleinPipeline
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--steps", type=int, default=4,
+                   help="4 дл€ distilled, 50 дл€ base")
+    p.add_argument("--guidance", type=float, default=1.0,
+                   help="1.0 дл€ distilled, 4.0 дл€ base")
+    p.add_argument("--width", type=int, default=1024)
+    p.add_argument("--height", type=int, default=1024)
+    p.add_argument("--output", default="/workspace/runs/flux_output.png")
+    p.add_argument("--log", default="/workspace/logs/flux.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== FLUX.2 [klein] 4B Generation ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Prompt: {args.prompt}\n")
+        f.write(f"Steps: {args.steps}, Guidance: {args.guidance}\n")
+
+    pipe = Flux2KleinPipeline.from_pretrained(
+        "black-forest-labs/FLUX.2-klein-4B",
+        torch_dtype=torch.bfloat16,
+    )
+    pipe.enable_model_cpu_offload()
+
+    t0 = time.perf_counter()
+    image = pipe(
+        prompt=args.prompt,
+        height=args.height,
+        width=args.width,
+        guidance_scale=args.guidance,
+        num_inference_steps=args.steps,
+        generator=torch.Generator(device="cuda").manual_seed(0),
+    ).images[0]
+    latency = (time.perf_counter() - t0) * 1000
+
+    image.save(args.output)
+
+    with open(args.log, "a") as f:
+        f.write(f"Latency: {latency:.2f} ms\n")
+
+    print(f"Generated: {args.output} ({latency:.2f} ms)")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# IMAGE EDITING (multi-reference)
+# =============================================================================
+COPY <<'PYTHON' /workspace/edit.py
+"""
+FLUX.2 [klein] 4B image editing.
+"""
+import os, time, argparse
+import torch
+from diffusers import Flux2KleinPipeline
+from PIL import Image
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--prompt", required=True)
+    p.add_argument("--image", required=True)
+    p.add_argument("--steps", type=int, default=4)
+    p.add_argument("--output", default="/workspace/runs/flux_edit.png")
+    p.add_argument("--log", default="/workspace/logs/flux_edit.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== FLUX.2 [klein] 4B Editing ===\n")
+        f.write(f"Prompt: {args.prompt}\n")
+        f.write(f"Input: {args.image}\n")
+
+    pipe = Flux2KleinPipeline.from_pretrained(
+        "black-forest-labs/FLUX.2-klein-4B",
+        torch_dtype=torch.bfloat16,
+    )
+    pipe.enable_model_cpu_offload()
+
+    init_image = Image.open(args.image).convert("RGB")
+
+    t0 = time.perf_counter()
+    image = pipe(
+        prompt=args.prompt,
+        image=init_image,
+        num_inference_steps=args.steps,
+        generator=torch.Generator(device="cuda").manual_seed(0),
+    ).images[0]
+    latency = (time.perf_counter() - t0) * 1000
+
+    image.save(args.output)
+
+    with open(args.log, "a") as f:
+        f.write(f"Latency: {latency:.2f} ms\n")
+
+    print(f"Edited: {args.output} ({latency:.2f} ms)")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

@@ -1,0 +1,73 @@
+# =============================================================================
+# detectron2_maskrcnn_docker.dockerfile
+# Detectron2 Mask R-CNN (Apache 2.0) — instance segmentation.
+#
+# ОТЛИЧИЕ ОТ SEMANTIC:
+#   Instance segmentation различает отдельные экземпляры объектов.
+#   Формат данных: COCO с полигонами (segmentation).
+#   Метрика: mask AP (не mIoU).
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ:
+#   Detectron2 v0.6 + torch 1.10.0 + cu113.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir detectron2 -f \
+    https://dl.fbaipublicfiles.com/detectron2/wheels/cu113/torch1.10/index.html
+
+RUN pip install --no-cache-dir \
+    pycocotools supervision opencv-python-headless \
+    onnx onnxruntime matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/output /workspace/logs /workspace/logs/plots
+
+# Конвертация LabelMe > COCO с полигонами
+COPY <<'PYTHON' /workspace/00_convert.py
+# ... (адаптация: вместо bbox пишем segmentation в COCO)
+PYTHON
+
+# Тренировка Mask R-CNN
+COPY <<'PYTHON' /workspace/01_train.py
+import os, time
+from detectron2.engine import DefaultTrainer
+from detectron2.config import get_cfg
+from detectron2 import model_zoo
+from detectron2.data.datasets import register_coco_instances
+
+COCO_DIR = "/workspace/datasets/coco"
+OUTPUT_DIR = "/workspace/output"
+NUM_CLASSES = int(os.environ.get("NUM_CLASSES", "3"))
+
+register_coco_instances("mydata_train", {}, f"{COCO_DIR}/train/_annotations.coco.json", f"{COCO_DIR}/train")
+register_coco_instances("mydata_valid", {}, f"{COCO_DIR}/valid/_annotations.coco.json", f"{COCO_DIR}/valid")
+
+cfg = get_cfg()
+cfg.merge_from_file(model_zoo.get_config_file("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml"))
+cfg.DATASETS.TRAIN = ("mydata_train",)
+cfg.DATASETS.TEST = ("mydata_valid",)
+cfg.DATALOADER.NUM_WORKERS = 2
+cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-InstanceSegmentation/mask_rcnn_R_50_FPN_3x.yaml")
+cfg.SOLVER.IMS_PER_BATCH = int(os.environ.get("BATCH", "2"))
+cfg.SOLVER.BASE_LR = 0.00025
+cfg.SOLVER.MAX_ITER = int(os.environ.get("MAX_ITER", "30000"))
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = NUM_CLASSES
+cfg.OUTPUT_DIR = OUTPUT_DIR
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+trainer = DefaultTrainer(cfg)
+trainer.resume_or_load(resume=False)
+trainer.train()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

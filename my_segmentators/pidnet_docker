@@ -1,0 +1,72 @@
+# =============================================================================
+# pidnet_docker.dockerfile
+# PIDNet (Apache 2.0, MMSegmentation) Ч real-time semantic segmentation.
+#
+# ј–’»“≈ “”–ј:
+#   “ри ветки: P (detail), I (context), D (boundary).
+#   P+I Ч основной выход, D Ч boundary refinement.
+#   PIDNet-S: 78.6 mIoU @ 93.2 FPS (Cityscapes) [citation:1]
+#   PIDNet-M: 79.8 mIoU @ 42.2 FPS [citation:1]
+#   PIDNet-L: 80.6 mIoU @ 31.1 FPS [citation:1]
+#
+# ѕќ„≈ћ” PIDNet:
+#   Ћучшее соотношение точность/скорость среди real-time сегментаторов.
+#   ≈сть готовый конфиг в MMSegmentation: configs/pidnet/ [citation:11]
+#   ¬еса: pidnet-s_imagenet1k, pidnet-l_imagenet1k [citation:2][citation:11]
+#
+# —ќ¬ћ≈—“»ћќ—“№ ¬≈–—»…:
+#   MMSegmentation v0.30.0 + mmcv-full 1.7.0 + torch 1.10.0 + cu113.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+RUN git clone -b 'v0.30.0' https://github.com/open-mmlab/mmsegmentation.git . \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir mmdet==2.27.0
+
+RUN pip install --no-cache-dir pybind11 onnxruntime onnx onnxsim \
+    && git clone -b 'v0.12.0' https://github.com/open-mmlab/mmdeploy.git /workspace/mmdeploy \
+    && cd /workspace/mmdeploy && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    scikit-learn lxml pycocotools supervision \
+    opencv-python-headless matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmsegmentation/data /workspace/work_dirs
+
+#  онвертаци€ Ч та же, что у DeepLabV3+ (LabelMe > PNG masks)
+COPY <<'PYTHON' /workspace/00_convert.py
+# ... (идентично deeplabv3plus_docker.dockerfile)
+PYTHON
+
+# “ренировка Ч PIDNet-S по умолчанию
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+cd /workspace/mmsegmentation
+python tools/train.py ${CONFIG:-configs/pidnet/pidnet-s_2xb6-120k_1024x1024-cityscapes.py} \
+    --work-dir /workspace/work_dirs/${RUN_NAME:-pidnet-s}
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+# ќстальные скрипты (02_test_pth.sh, 03_export_onnx.sh, 04_test_onnx.py, pipeline.sh)
+# идентичны DeepLabV3+.
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

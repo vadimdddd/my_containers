@@ -1,0 +1,480 @@
+# =============================================================================
+# rfdetr_docker.dockerfile
+# RF-DETR (Apache 2.0) — полностью автоматический пайплайн:
+#   train > test .pth > export .onnx > test .onnx > plots
+#
+# ЗАЧЕМ ЭТОТ ОБРАЗ:
+#   Один `docker run` выполняет все 5 стадий и даёт готовую .onnx + 6 логов
+#   + 4 графика.
+#
+# ЛИЦЕНЗИЯ:
+#   Apache 2.0 на код и веса. Можно в закрытых коммерческих продуктах.
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ:
+#   pyproject.toml требует torch>=2.2.0. Используем PyTorch 2.6.0 + CUDA 12.6.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# БАЗОВЫЙ ОБРАЗ: PyTorch 2.6.0 + CUDA 12.6 + cuDNN 9 (devel)
+#
+# ПОЧЕМУ devel: pycocotools содержит C-расширения — нужен nvcc.
+# ПОЧЕМУ 2.6.0: версия из примеров установки, стабильно работает с rfdetr.
+# -----------------------------------------------------------------------------
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+# -----------------------------------------------------------------------------
+# СИСТЕМНЫЕ ЗАВИСИМОСТИ
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# -----------------------------------------------------------------------------
+# ФИКСАЦИЯ TORCH/TORCHVISION ПОД CUDA 12.6
+#   Явная установка гарантирует GPU-сборку, а не CPU.
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# -----------------------------------------------------------------------------
+# УСТАНОВКА RF-DETR
+#   rfdetr[onnx] — фреймворк + ONNX-экспорт. Содержит RFDETRBase / Medium / Large,
+#   автоматически скачивающие предобученные веса COCO при первом запуске.
+#   albumentations, supervision, pycocotools — CV-утилиты.
+#   matplotlib, seaborn, pandas — графики.
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    "rfdetr[onnx]" \
+    albumentations supervision pycocotools wandb \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# СТАДИЯ 1/5: ТРЕНИРОВКА
+# =============================================================================
+COPY <<'PYTHON' /workspace/01_train.py
+import argparse, os, time
+import torch
+from rfdetr import RFDETRBase, RFDETRMedium, RFDETRLarge
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--dataset", default=os.environ["DATASET_DIR"])
+    p.add_argument("--model", default=os.environ.get("MODEL_SIZE", "medium"),
+                   choices=["base", "medium", "large"])
+    p.add_argument("--epochs", type=int, default=int(os.environ.get("EPOCHS", 50)))
+    p.add_argument("--batch", type=int, default=int(os.environ.get("BATCH", 4)))
+    p.add_argument("--output", default=os.environ.get("OUTPUT_DIR", "/workspace/runs/rfdetr"))
+    p.add_argument("--log", default="/workspace/logs/01_train.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== RF-DETR Training ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}\n")
+        f.write(f"Dataset: {args.dataset}\nModel: {args.model}\n---\n")
+
+    model_cls = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}[args.model]
+    model = model_cls()
+    model.train(dataset_dir=args.dataset, epochs=args.epochs,
+                batch_size=args.batch, output_dir=args.output)
+
+    with open(args.log, "a") as f:
+        f.write(f"Training complete. Weights: {args.output}\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 2/5: ТЕСТ .pth
+# =============================================================================
+COPY <<'PYTHON' /workspace/02_test_pth.py
+import os, time, pickle
+from rfdetr import RFDETRBase, RFDETRMedium, RFDETRLarge
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from pathlib import Path
+
+def main():
+    weights = os.environ["TRAINED_WEIGHTS"]
+    dataset = os.environ["TEST_ANNOTATIONS"]
+    images = os.environ["TEST_IMAGES"]
+    model_size = os.environ.get("MODEL_SIZE", "medium")
+    log = "/workspace/logs/02_test_pth.log"
+
+    with open(log, "a") as f:
+        f.write(f"=== RF-DETR Test (PTH) ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Weights: {weights}\n---\n")
+
+    model_cls = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}[model_size]
+    model = model_cls(pretrain_weights=weights)
+
+    coco = COCO(dataset)
+    results, latencies = [], []
+    for img_id in coco.getImgIds():
+        info = coco.loadImgs(img_id)[0]
+        path = str(Path(images) / info["file_name"])
+        t0 = time.perf_counter()
+        dets = model.predict(path, threshold=0.5)
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+        for i in range(len(dets.xyxy)):
+            x1, y1, x2, y2 = dets.xyxy[i].tolist()
+            results.append({
+                "image_id": img_id,
+                "category_id": int(dets.class_id[i]) + 1,
+                "bbox": [x1, y1, x2 - x1, y2 - y1],
+                "score": float(dets.confidence[i]),
+            })
+
+    coco_dt = coco.loadRes(results)
+    ev = COCOeval(coco, coco_dt, "bbox")
+    ev.evaluate(); ev.accumulate(); ev.summarize()
+
+    with open(log, "a") as f:
+        f.write(f"mAP@0.5: {ev.stats[1]:.4f}\n")
+        f.write(f"mAP@0.5:0.95: {ev.stats[0]:.4f}\n")
+        f.write(f"Avg latency: {sum(latencies)/len(latencies):.2f} ms\n")
+        f.write("PTH test complete.\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 3/5: ЭКСПОРТ В ONNX
+# =============================================================================
+COPY <<'PYTHON' /workspace/03_export_onnx.py
+import os, time
+from rfdetr import RFDETRBase, RFDETRMedium, RFDETRLarge
+
+def main():
+    weights = os.environ["TRAINED_WEIGHTS"]
+    output = os.environ.get("ONNX_OUTPUT", "/workspace/runs/rfdetr_onnx")
+    model_size = os.environ.get("MODEL_SIZE", "medium")
+    log = "/workspace/logs/03_export.log"
+
+    with open(log, "a") as f:
+        f.write(f"=== RF-DETR ONNX Export ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Weights: {weights}\n---\n")
+
+    model_cls = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}[model_size]
+    model = model_cls(pretrain_weights=weights)
+    model.export(output_dir=output, format="onnx")
+
+    with open(log, "a") as f:
+        f.write(f"Exported to {output}\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 4/5: ТЕСТ .onnx
+# =============================================================================
+COPY <<'PYTHON' /workspace/04_test_onnx.py
+import os, time, pickle
+from rfdetr import RFDETRBase, RFDETRMedium, RFDETRLarge
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+from pathlib import Path
+
+def main():
+    onnx_path = os.environ["ONNX_PATH"]
+    dataset = os.environ["TEST_ANNOTATIONS"]
+    images = os.environ["TEST_IMAGES"]
+    model_size = os.environ.get("MODEL_SIZE", "medium")
+    log = "/workspace/logs/04_test_onnx.log"
+
+    with open(log, "a") as f:
+        f.write(f"=== RF-DETR Test (ONNX) ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"ONNX: {onnx_path}\n---\n")
+
+    model_cls = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}[model_size]
+    model = model_cls(onnx_path=onnx_path)
+
+    coco = COCO(dataset)
+    results, latencies = [], []
+    for img_id in coco.getImgIds():
+        info = coco.loadImgs(img_id)[0]
+        path = str(Path(images) / info["file_name"])
+        t0 = time.perf_counter()
+        dets = model.predict(path, threshold=0.5)
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+        for i in range(len(dets.xyxy)):
+            x1, y1, x2, y2 = dets.xyxy[i].tolist()
+            results.append({
+                "image_id": img_id,
+                "category_id": int(dets.class_id[i]) + 1,
+                "bbox": [x1, y1, x2 - x1, y2 - y1],
+                "score": float(dets.confidence[i]),
+            })
+
+    coco_dt = coco.loadRes(results)
+    ev = COCOeval(coco, coco_dt, "bbox")
+    ev.evaluate(); ev.accumulate(); ev.summarize()
+
+    with open(log, "a") as f:
+        f.write(f"mAP@0.5: {ev.stats[1]:.4f}\n")
+        f.write(f"mAP@0.5:0.95: {ev.stats[0]:.4f}\n")
+        f.write(f"Avg latency: {sum(latencies)/len(latencies):.2f} ms\n")
+        f.write("ONNX test complete.\n")
+
+    class_names = [c["name"] for c in coco.loadCats(coco.getCatIds())]
+    with open("/workspace/logs/plots/coco_eval.pkl", "wb") as f:
+        pickle.dump({"coco_eval": ev, "class_names": class_names, "results": results}, f)
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 5/5: ГРАФИКИ
+# =============================================================================
+COPY <<'PYTHON' /workspace/05_plots.py
+import os, json, pickle
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+PLOTS_DIR = "/workspace/logs/plots"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+
+def plot_training_curves():
+    metrics_json = Path("/workspace/runs/rfdetr/metrics.json")
+    if not metrics_json.exists():
+        print(f"[SKIP] {metrics_json} not found")
+        return
+    with open(metrics_json) as f:
+        metrics = json.load(f)
+    epochs = list(range(1, len(metrics.get("loss", [])) + 1))
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("RF-DETR Training Curves", fontsize=16, fontweight="bold")
+    plots = [
+        ("loss", "Training Loss", "#E74C3C"),
+        ("mAP50", "Validation mAP@0.5", "#2ECC71"),
+        ("mAP50-95", "Validation mAP@0.5:0.95", "#27AE60"),
+        ("lr", "Learning Rate", "#3498DB"),
+    ]
+    for ax, (key, title, color) in zip(axes.flat, plots):
+        vals = metrics.get(key, [])
+        if vals and len(vals) == len(epochs):
+            ax.plot(epochs, vals, color=color, linewidth=1.5)
+            ax.set_title(title); ax.set_xlabel("Epoch"); ax.grid(alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, f"{key}\nnot found", ha="center", va="center")
+            ax.set_title(title)
+    plt.tight_layout()
+    out = f"{PLOTS_DIR}/01_training_curves.png"
+    plt.savefig(out, dpi=150); plt.close()
+    print(f"[OK] {out}")
+
+
+def plot_pr_curves(coco_eval, class_names=None):
+    precision = coco_eval.eval["precision"]
+    recall = coco_eval.eval["recall"]
+    p = precision[:, :, 0, -1]
+    r = recall[:, 0, -1]
+    K = p.shape[1]
+    if class_names is None:
+        class_names = [f"class_{i}" for i in range(K)]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for k in range(K):
+        if r[k] > 0 or p[k].max() > 0:
+            auc = np.trapz(p[k], r[k])
+            ax.plot(r[k], p[k], label=f"{class_names[k]} (AP={auc:.3f})", linewidth=1.5)
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.set_title("RF-DETR Precision-Recall Curves (IoU=0.5) — AUC-PR = AP")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
+    ax.legend(loc="lower left", fontsize=8); ax.grid(alpha=0.3)
+    out = f"{PLOTS_DIR}/02_pr_curves.png"
+    plt.savefig(out, dpi=150); plt.close()
+    print(f"[OK] {out}")
+
+
+def plot_confusion_matrix(coco, results, class_names):
+    try:
+        import supervision as sv
+        preds = sv.Detections.from_coco_annotations(results)
+        gt_list = []
+        for img_id in coco.getImgIds():
+            ann_ids = coco.getAnnIds(imgIds=img_id)
+            anns = coco.loadAnns(ann_ids)
+            for ann in anns:
+                gt_list.append({
+                    "image_id": img_id,
+                    "category_id": ann["category_id"],
+                    "bbox": ann["bbox"],
+                })
+        targets = sv.Detections.from_coco_annotations(gt_list)
+        cm = sv.ConfusionMatrix.from_detections(
+            predictions=preds, targets=targets, classes=class_names
+        )
+        cm.plot()
+        out = f"{PLOTS_DIR}/03_confusion_matrix.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+        print(f"[OK] {out}")
+    except Exception as e:
+        print(f"[SKIP] Confusion matrix: {e}")
+
+
+def plot_confidence_profile(results, coco, class_names):
+    if not results:
+        return
+    scores = np.array([r["score"] for r in results])
+    thresholds = np.linspace(0.01, 0.99, 50)
+    precisions, recalls, f1s = [], [], []
+    n_gt = sum(len(coco.getAnnIds(imgIds=i)) for i in coco.getImgIds())
+    for t in thresholds:
+        mask = scores >= t
+        tp = mask.sum(); fp = (~mask).sum(); fn = max(0, n_gt - tp)
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        precisions.append(p); recalls.append(r); f1s.append(f1)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(thresholds, precisions, label="Precision", color="#3498DB")
+    ax.plot(thresholds, recalls, label="Recall", color="#2ECC71")
+    ax.plot(thresholds, f1s, label="F1", color="#E74C3C")
+    best_t = thresholds[np.argmax(f1s)]
+    ax.axvline(best_t, linestyle="--", color="gray", alpha=0.7,
+               label=f"F1-optimal: {best_t:.2f}")
+    ax.set_xlabel("Confidence Threshold"); ax.set_ylabel("Metric Value")
+    ax.set_title("Confidence Profile")
+    ax.legend(); ax.grid(alpha=0.3)
+    out = f"{PLOTS_DIR}/04_confidence_profile.png"
+    plt.savefig(out, dpi=150); plt.close()
+    print(f"[OK] {out}")
+
+
+if __name__ == "__main__":
+    mode = os.environ.get("PLOT_MODE", "test")
+    if mode == "train":
+        plot_training_curves()
+    else:
+        pkl = Path(f"{PLOTS_DIR}/coco_eval.pkl")
+        if pkl.exists():
+            with open(pkl, "rb") as f:
+                data = pickle.load(f)
+            plot_pr_curves(data["coco_eval"], data.get("class_names"))
+            from pycocotools.coco import COCO
+            coco = COCO(os.environ["TEST_ANNOTATIONS"])
+            plot_confusion_matrix(coco, data["results"], data.get("class_names"))
+            plot_confidence_profile(data["results"], coco, data.get("class_names"))
+        else:
+            print("[SKIP] coco_eval.pkl not found")
+PYTHON
+
+# =============================================================================
+# ГЛАВНЫЙ PIPELINE (entrypoint)
+# =============================================================================
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG
+}
+
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "=========================================="
+log "RF-DETR Automated Pipeline START"
+log "=========================================="
+
+if [ -z "${DATASET_DIR}" ]; then
+    log "ERROR: DATASET_DIR is not set"
+    exit 1
+fi
+
+RUN_NAME=${RUN_NAME:-rfdetr}
+TRAINED_WEIGHTS=${TRAINED_WEIGHTS:-/workspace/runs/${RUN_NAME}/best.pth}
+ONNX_OUTPUT=${ONNX_OUTPUT:-/workspace/runs/${RUN_NAME}_onnx}
+ONNX_PATH=${ONNX_PATH:-${ONNX_OUTPUT}/inference_model.onnx}
+TEST_ANNOTATIONS=${TEST_ANNOTATIONS:-${DATASET_DIR}/test/_annotations.coco.json}
+TEST_IMAGES=${TEST_IMAGES:-${DATASET_DIR}/test}
+
+export RUN_NAME TRAINED_WEIGHTS ONNX_OUTPUT ONNX_PATH TEST_ANNOTATIONS TEST_IMAGES
+
+log "Config: RUN_NAME=$RUN_NAME, MODEL_SIZE=${MODEL_SIZE:-medium}, EPOCHS=${EPOCHS:-50}, BATCH=${BATCH:-4}"
+log "Dataset: $DATASET_DIR"
+log "Expected ONNX: $ONNX_PATH"
+log ""
+
+CURRENT_STEP="1/5 TRAIN"
+log "STEP 1/5: Training started > logs/01_train.log"
+START=$(date +%s)
+python /workspace/01_train.py
+END=$(date +%s)
+log "STEP 1/5: Training finished in $((END-START))s"
+log "  > Generating training curves..."
+PLOT_MODE=train python /workspace/05_plots.py 2>&1 | tee -a $MASTER_LOG
+log ""
+
+CURRENT_STEP="2/5 TEST PTH"
+log "STEP 2/5: Testing .pth started > logs/02_test_pth.log"
+START=$(date +%s)
+python /workspace/02_test_pth.py
+END=$(date +%s)
+log "STEP 2/5: Testing .pth finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="3/5 EXPORT ONNX"
+log "STEP 3/5: Exporting to ONNX started > logs/03_export.log"
+START=$(date +%s)
+python /workspace/03_export_onnx.py
+END=$(date +%s)
+log "STEP 3/5: Export finished in $((END-START))s"
+
+if [ ! -f "${ONNX_PATH}" ]; then
+    log "ERROR: ONNX file not found at ${ONNX_PATH}"
+    exit 1
+fi
+log "  ? ONNX created: ${ONNX_PATH}"
+log ""
+
+CURRENT_STEP="4/5 TEST ONNX"
+log "STEP 4/5: Testing .onnx started > logs/04_test_onnx.log"
+START=$(date +%s)
+python /workspace/04_test_onnx.py
+END=$(date +%s)
+log "STEP 4/5: Testing .onnx finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="5/5 PLOTS"
+log "STEP 5/5: Generating PR curves + confusion matrix + confidence profile..."
+START=$(date +%s)
+python /workspace/05_plots.py 2>&1 | tee -a $MASTER_LOG
+END=$(date +%s)
+log "STEP 5/5: Plots finished in $((END-START))s"
+log "  > Plots: /workspace/logs/plots/"
+log ""
+
+log "=========================================="
+log "Pipeline COMPLETE"
+log "Final ONNX: ${ONNX_PATH}"
+log "Logs: /workspace/logs/"
+log "Plots: /workspace/logs/plots/"
+log "=========================================="
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

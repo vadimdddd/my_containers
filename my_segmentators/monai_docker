@@ -1,0 +1,75 @@
+# =============================================================================
+# monai_docker.dockerfile
+# MONAI (Apache 2.0) — медицинская сегментация (3D/2D).
+#
+# ВАЖНО:
+#   MONAI — это НЕ semantic segmentation на 2D-изображениях в том же смысле,
+#   что DeepLabV3+ или U-Net. Это фреймворк для медицинской визуализации:
+#   - 3D-данные (DICOM, NIfTI)
+#   - 3D-архитектуры (UNETR, SwinUNETR)
+#   - Специализированные метрики (Dice, Hausdorff)
+#   - Трансформы для медицинских данных
+#
+#   Для промышленного CV на 2D-изображениях используйте MMSegmentation.
+#
+# БАЗОВЫЙ ОБРАЗ: NGC PyTorch 24.08 (CUDA 12.x)
+# =============================================================================
+
+FROM nvcr.io/nvidia/pytorch:24.08-py3
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# MONAI устанавливается из исходников или через pip
+# Для стабильности используем pip-версию
+RUN pip install --no-cache-dir monai[all]
+
+# MONAI-specific зависимости
+RUN pip install --no-cache-dir \
+    nibabel pydicom itk itk-io \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/output /workspace/logs /workspace/logs/plots
+
+# Скрипт для медицинских данных (DICOM/NIfTI)
+COPY <<'PYTHON' /workspace/01_train_monai.py
+"""
+MONAI training для медицинской сегментации.
+Формат данных: NIfTI или DICOM.
+"""
+import os
+import torch
+from monai.networks.nets import UNETR, SwinUNETR
+from monai.losses import DiceLoss
+from monai.metrics import DiceMetric
+from monai.data import Dataset, DataLoader
+from monai.transforms import Compose, LoadImaged, EnsureChannelFirstd, ScaleIntensityd, RandSpatialCropd
+
+# Пример пайплайна для 3D-данных
+train_transforms = Compose([
+    LoadImaged(keys=["image", "label"]),
+    EnsureChannelFirstd(keys=["image", "label"]),
+    ScaleIntensityd(keys=["image"]),
+    RandSpatialCropd(keys=["image", "label"], roi_size=(96, 96, 96), random_size=False),
+])
+
+# UNETR для 3D-сегментации
+model = UNETR(
+    in_channels=1,
+    out_channels=int(os.environ.get("NUM_CLASSES", "3")),
+    img_size=(96, 96, 96),
+    feature_size=16,
+    hidden_size=768,
+    mlp_dim=3072,
+    num_heads=12,
+    norm_name="instance",
+)
+
+print("MONAI model initialized:", model.__class__.__name__)
+print("Для использования: подготовьте NIfTI/DICOM данные и запустите обучение")
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

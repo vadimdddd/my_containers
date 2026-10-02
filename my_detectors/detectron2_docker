@@ -1,0 +1,584 @@
+# =============================================================================
+# detectron2_docker.dockerfile
+# Detectron2 (Apache 2.0) — two-stage детектор Faster R-CNN.
+#
+# АРХИТЕКТУРА:
+#   Stage 1: ResNet-50 + FPN > RPN (region proposals)
+#   Stage 2: RoIAlign > FastRCNNConvFCHead (classification + bbox regression)
+#
+# ПОЧЕМУ DETECTRON2:
+#   - Apache 2.0, коммерчески дружелюбная лицензия.
+#   - PyTorch-нативный код, легко модифицировать head/backbone/loss.
+#   - Готовые веса COCO для Faster R-CNN и Cascade R-CNN.
+#   - Простой ONNX-экспорт через torch.onnx.export.
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ:
+#   Detectron2 v0.6 собран под torch 1.10.0 + cu113.
+#   Используем pre-built wheel, чтобы не собирать из исходников.
+#   OpenCV, pycocotools, onnxruntime — для теста и экспорта.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+# -----------------------------------------------------------------------------
+# СИСТЕМНЫЕ ЗАВИСИМОСТИ
+#   git, wget — клонирование и скачивание
+#   libgl1, libglib2.0-0, libsm6, libxext6 — OpenCV
+#   gcc, g++ — для pycocotools
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# -----------------------------------------------------------------------------
+# ФИКСАЦИЯ TORCHVISION ПОД CUDA 11.3
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+# -----------------------------------------------------------------------------
+# DETECTRON2 v0.6 (pre-built wheel для torch1.10.0 + cu113)
+#
+# ЗАЧЕМ pre-built: сборка из исходников занимает 20-40 минут и требует
+#                   точного совпадения TORCH_CUDA_ARCH_LIST с GPU.
+#                   Wheel быстрее и стабильнее.
+#
+# ЧТО ДАЁТ: detectron2.models, detectron2.engine, detectron2.config —
+#           всё для тренировки Faster R-CNN на COCO-формате.
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir detectron2 -f \
+    https://dl.fbaipublicfiles.com/detectron2/wheels/cu113/torch1.10/index.html
+
+# -----------------------------------------------------------------------------
+# ДОПОЛНИТЕЛЬНЫЕ ЗАВИСИМОСТИ
+#   pycocotools — COCOeval для mAP
+#   opencv-python-headless — OpenCV без GUI
+#   onnx, onnxruntime — экспорт и инференс
+#   supervision — confusion matrix
+#   matplotlib, seaborn, pandas — графики
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    pycocotools supervision \
+    opencv-python-headless \
+    onnx onnxruntime onnxsim \
+    matplotlib seaborn pandas scipy
+
+# -----------------------------------------------------------------------------
+# ДИРЕКТОРИИ
+# -----------------------------------------------------------------------------
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/output
+
+# =============================================================================
+# СТАДИЯ 0/6: КОНВЕРТАЦИЯ ДАТАСЕТА
+#   LabelMe JSON > COCO (Detectron2 работает только с COCO-форматом)
+#
+# ЧТО ДЕЛАЕТ:
+#   Конвертирует LabelMe JSON+JPG в COCO JSON, который Detectron2
+#   регистрирует через register_coco_instances().
+#
+# ЧТО НА ВЫХОДЕ:
+#   /workspace/datasets/coco/train/_annotations.coco.json
+#   /workspace/datasets/coco/valid/_annotations.coco.json
+#   /workspace/datasets/coco/test/_annotations.coco.json
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""LabelMe JSON > COCO для Detectron2."""
+import os, sys, glob, json, shutil
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+COCO_DIR = os.environ.get("COCO_DIR", "/workspace/datasets/coco")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.05"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+
+
+def find_subfolders(root):
+    trainval, test = [], []
+    for dp, dn, fn in os.walk(root):
+        if not any(f.endswith('.json') for f in fn):
+            continue
+        d = os.path.basename(dp).lower()
+        if 'test' in d:
+            test.append(dp)
+        elif 'trainval' in d or 'train' in d:
+            trainval.append(dp)
+        else:
+            trainval.append(dp)
+    return sorted(trainval), sorted(test)
+
+
+def make_coco_json(json_files, label_list, out_path, img_dir, start_id=0):
+    images, annotations = [], []
+    ann_id = start_id
+    for img_id, fname in enumerate(json_files):
+        base = os.path.splitext(os.path.basename(fname))[0]
+        src_dir = os.path.dirname(fname)
+        jpeg_in = os.path.join(src_dir, base + '.jpg')
+        jpeg_out = os.path.join(img_dir, base + '.jpg')
+        if os.path.exists(jpeg_in):
+            shutil.copy2(jpeg_in, jpeg_out)
+        img = cv2.imread(jpeg_out)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        with open(fname, encoding='utf-8') as f:
+            data = json.load(f)
+
+        images.append({
+            "id": img_id,
+            "file_name": base + '.jpg',
+            "width": w,
+            "height": h,
+        })
+
+        for shape in data.get('shapes', []):
+            label = shape['label']
+            if label not in label_list:
+                continue
+            pts = np.array(shape['points']).astype(int)
+            x_min, y_min = np.min(pts, axis=0)
+            x_max, y_max = np.max(pts, axis=0)
+            x_min = max(0, min(x_min, w))
+            x_max = max(0, min(x_max, w))
+            y_min = max(0, min(y_min, h))
+            y_max = max(0, min(y_max, h))
+            if x_max <= x_min or y_max <= y_min:
+                continue
+            annotations.append({
+                "id": ann_id,
+                "image_id": img_id,
+                "category_id": label_list.index(label) + 1,
+                "bbox": [int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)],
+                "area": int((x_max - x_min) * (y_max - y_min)),
+                "iscrowd": 0,
+            })
+            ann_id += 1
+
+    categories = [{"id": i + 1, "name": name} for i, name in enumerate(label_list)]
+    coco = {"images": images, "annotations": annotations, "categories": categories}
+    with open(out_path, 'w') as f:
+        json.dump(coco, f)
+    print(f"[OK] {out_path}: {len(images)} images, {len(annotations)} annotations")
+    return ann_id
+
+
+def main():
+    for sub in ['train', 'valid', 'test']:
+        os.makedirs(os.path.join(COCO_DIR, sub), exist_ok=True)
+
+    paths_trainval, paths_test = find_subfolders(DATASETS_DIR)
+    if not paths_trainval and not paths_test:
+        print("ERROR: No LabelMe JSON found")
+        sys.exit(1)
+
+    obj_candidates = [os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)]
+    if paths_trainval:
+        obj_candidates.append(os.path.join(paths_trainval[0], OBJ_NAMES_FILE))
+    obj_path = next((p for p in obj_candidates if os.path.exists(p)), None)
+    if obj_path is None:
+        print(f"ERROR: {OBJ_NAMES_FILE} not found")
+        sys.exit(1)
+
+    with open(obj_path) as f:
+        LABEL_LIST = [l.strip() for l in f if l.strip()]
+    print(f"Classes: {LABEL_LIST}")
+
+    trainval_json = []
+    for p in paths_trainval:
+        trainval_json.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+    test_json = []
+    for p in paths_test:
+        test_json.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+
+    if len(trainval_json) > 1:
+        train_ids, val_ids = train_test_split(trainval_json, test_size=SPLIT_SIZE,
+                                               random_state=RANDOM_STATE)
+    else:
+        train_ids, val_ids = trainval_json, []
+
+    make_coco_json(train_ids, LABEL_LIST,
+                   os.path.join(COCO_DIR, 'train', '_annotations.coco.json'),
+                   os.path.join(COCO_DIR, 'train'))
+    make_coco_json(val_ids, LABEL_LIST,
+                   os.path.join(COCO_DIR, 'valid', '_annotations.coco.json'),
+                   os.path.join(COCO_DIR, 'valid'))
+    make_coco_json(test_json, LABEL_LIST,
+                   os.path.join(COCO_DIR, 'test', '_annotations.coco.json'),
+                   os.path.join(COCO_DIR, 'test'))
+
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 1/6: ТРЕНИРОВКА (Detectron2 DefaultTrainer)
+# =============================================================================
+COPY <<'PYTHON' /workspace/01_train.py
+"""Detectron2 Faster R-CNN training."""
+import os, time
+from detectron2.engine import DefaultTrainer
+from detectron2.config import get_cfg
+from detectron2 import model_zoo
+from detectron2.data.datasets import register_coco_instances
+
+COCO_DIR = os.environ.get("COCO_DIR", "/workspace/datasets/coco")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/workspace/output")
+NUM_CLASSES = int(os.environ.get("NUM_CLASSES", "3"))
+EPOCHS = int(os.environ.get("EPOCHS", "12"))
+BATCH = int(os.environ.get("BATCH", "2"))
+BASE_LR = float(os.environ.get("BASE_LR", "0.00025"))
+MODEL = os.environ.get("MODEL_CFG", "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
+
+with open("/workspace/logs/01_train.log", "a") as f:
+    f.write(f"=== Detectron2 Training ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Model: {MODEL}\nNum classes: {NUM_CLASSES}\nEpochs: {EPOCHS}\n---\n")
+
+register_coco_instances("mydata_train", {},
+                        os.path.join(COCO_DIR, "train", "_annotations.coco.json"),
+                        os.path.join(COCO_DIR, "train"))
+register_coco_instances("mydata_valid", {},
+                        os.path.join(COCO_DIR, "valid", "_annotations.coco.json"),
+                        os.path.join(COCO_DIR, "valid"))
+
+cfg = get_cfg()
+cfg.merge_from_file(model_zoo.get_config_file(MODEL))
+cfg.DATASETS.TRAIN = ("mydata_train",)
+cfg.DATASETS.TEST = ("mydata_valid",)
+cfg.DATALOADER.NUM_WORKERS = int(os.environ.get("WORKERS", "2"))
+cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url(MODEL)
+cfg.SOLVER.IMS_PER_BATCH = BATCH
+cfg.SOLVER.BASE_LR = BASE_LR
+# 1 epoch = len(train) / batch iterations. Detectron2 uses iterations.
+# Approximate: 12 epochs for ~5000 images ~ 30000 iters. Scale by data size.
+cfg.SOLVER.MAX_ITER = int(os.environ.get("MAX_ITER", "30000"))
+cfg.SOLVER.STEPS = (int(cfg.SOLVER.MAX_ITER * 0.67), int(cfg.SOLVER.MAX_ITER * 0.89))
+cfg.MODEL.ROI_HEADS.BATCH_SIZE_PER_IMAGE = 512
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = NUM_CLASSES
+cfg.OUTPUT_DIR = OUTPUT_DIR
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+trainer = DefaultTrainer(cfg)
+trainer.resume_or_load(resume=False)
+trainer.train()
+
+with open("/workspace/logs/01_train.log", "a") as f:
+    f.write("Training complete.\n")
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 2/6: ТЕСТ .pth
+# =============================================================================
+COPY <<'PYTHON' /workspace/02_test_pth.py
+"""Detectron2 evaluation on test set."""
+import os, time, pickle, json
+from detectron2.engine import DefaultPredictor
+from detectron2.config import get_cfg
+from detectron2 import model_zoo
+from detectron2.data.datasets import register_coco_instances
+from detectron2.data import build_detection_test_loader, MetadataCatalog
+from detectron2.evaluation import COCOEvaluator, inference_on_dataset
+from detectron2.modeling import build_model
+import torch
+
+COCO_DIR = os.environ.get("COCO_DIR", "/workspace/datasets/coco")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/workspace/output")
+NUM_CLASSES = int(os.environ.get("NUM_CLASSES", "3"))
+MODEL = os.environ.get("MODEL_CFG", "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
+WEIGHTS = os.environ.get("WEIGHTS", os.path.join(OUTPUT_DIR, "model_final.pth"))
+
+with open("/workspace/logs/02_test_pth.log", "a") as f:
+    f.write(f"=== Detectron2 Test (PTH) ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Weights: {WEIGHTS}\n---\n")
+
+register_coco_instances("mydata_test", {},
+                        os.path.join(COCO_DIR, "test", "_annotations.coco.json"),
+                        os.path.join(COCO_DIR, "test"))
+
+cfg = get_cfg()
+cfg.merge_from_file(model_zoo.get_config_file(MODEL))
+cfg.MODEL.WEIGHTS = WEIGHTS
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = NUM_CLASSES
+cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = 0.05
+
+model = build_model(cfg)
+model.eval()
+
+evaluator = COCOEvaluator("mydata_test", cfg, False, output_dir="/workspace/logs")
+val_loader = build_detection_test_loader(cfg, "mydata_test")
+results = inference_on_dataset(model, val_loader, evaluator)
+
+with open("/workspace/logs/02_test_pth.log", "a") as f:
+    f.write(json.dumps(results, indent=2) + "\n")
+
+# Save results for plots
+with open("/workspace/logs/plots/coco_eval.pkl", "wb") as f:
+    pickle.dump({"results": results, "cfg": cfg}, f)
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 3/6: ЭКСПОРТ В ONNX
+# =============================================================================
+COPY <<'PYTHON' /workspace/03_export_onnx.py
+"""Detectron2 Faster R-CNN > ONNX (через tracing)."""
+import os, time, torch
+from detectron2.config import get_cfg
+from detectron2 import model_zoo
+from detectron2.modeling import build_model
+
+COCO_DIR = os.environ.get("COCO_DIR", "/workspace/datasets/coco")
+NUM_CLASSES = int(os.environ.get("NUM_CLASSES", "3"))
+MODEL = os.environ.get("MODEL_CFG", "COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml")
+WEIGHTS = os.environ.get("WEIGHTS", "/workspace/output/model_final.pth")
+ONNX_PATH = os.environ.get("ONNX_PATH", "/workspace/runs/onnx/model.onnx")
+IMG_SIZE = int(os.environ.get("IMG_SIZE", "640"))
+
+os.makedirs(os.path.dirname(ONNX_PATH), exist_ok=True)
+
+with open("/workspace/logs/03_export.log", "a") as f:
+    f.write(f"=== Detectron2 ONNX Export ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+cfg = get_cfg()
+cfg.merge_from_file(model_zoo.get_config_file(MODEL))
+cfg.MODEL.WEIGHTS = WEIGHTS
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = NUM_CLASSES
+
+model = build_model(cfg)
+model.eval()
+model.to("cuda")
+
+# Detectron2 Faster R-CNN returns list of dicts. ONNX tracing requires tensor output.
+# Use torch.onnx.export with a wrapper that returns tensors.
+class Wrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+    def forward(self, x):
+        outputs = self.model([{"image": x[0]}])
+        out = outputs[0]
+        return out["instances"].pred_boxes.tensor, out["instances"].scores, out["instances"].pred_classes
+
+dummy = torch.randn(1, 3, IMG_SIZE, IMG_SIZE).cuda()
+wrapper = Wrapper(model).cuda()
+
+torch.onnx.export(
+    wrapper, dummy, ONNX_PATH,
+    input_names=["input"],
+    output_names=["boxes", "scores", "labels"],
+    opset_version=13,
+    dynamic_axes={"input": {2: "h", 3: "w"}},
+)
+
+with open("/workspace/logs/03_export.log", "a") as f:
+    f.write(f"ONNX exported: {ONNX_PATH}\n")
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 4/6: ТЕСТ .onnx
+# =============================================================================
+COPY <<'PYTHON' /workspace/04_test_onnx.py
+"""ONNX Runtime evaluation for Detectron2 Faster R-CNN."""
+import argparse, os, time, pickle, json
+import cv2
+import numpy as np
+import onnxruntime as ort
+from pathlib import Path
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+
+def preprocess(img, imgsz=640):
+    img = cv2.resize(img, (imgsz, imgsz))
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+    mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+    std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+    img = (img - mean) / std
+    return np.expand_dims(img.transpose(2, 0, 1), axis=0)
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--onnx", default=os.environ.get("ONNX_PATH"))
+    p.add_argument("--dataset", default=os.path.join(os.environ.get("COCO_DIR", "/workspace/datasets/coco"), "test", "_annotations.coco.json"))
+    p.add_argument("--images", default=os.path.join(os.environ.get("COCO_DIR", "/workspace/datasets/coco"), "test"))
+    p.add_argument("--log", default="/workspace/logs/04_test_onnx.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== Detectron2 Test (ONNX) ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"ONNX: {args.onnx}\n---\n")
+
+    session = ort.InferenceSession(args.onnx, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    coco = COCO(args.dataset)
+    results, latencies = [], []
+    for img_id in coco.getImgIds():
+        info = coco.loadImgs(img_id)[0]
+        img = cv2.imread(str(Path(args.images) / info["file_name"]))
+        if img is None:
+            continue
+        inp = preprocess(img)
+        t0 = time.perf_counter()
+        outputs = session.run(None, {input_name: inp})
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+
+        boxes, scores, labels = outputs
+        for box, score, label in zip(boxes, scores, labels):
+            x1, y1, x2, y2 = box
+            if score < 0.05:
+                continue
+            results.append({
+                "image_id": img_id,
+                "category_id": int(label) + 1,
+                "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
+                "score": float(score),
+            })
+
+    if not results:
+        with open(args.log, "a") as f:
+            f.write("WARN: no detections\n")
+        return
+
+    coco_dt = coco.loadRes(results)
+    ev = COCOeval(coco, coco_dt, "bbox")
+    ev.evaluate(); ev.accumulate(); ev.summarize()
+
+    with open(args.log, "a") as f:
+        f.write(f"mAP@0.5: {ev.stats[1]:.4f}\n")
+        f.write(f"mAP@0.5:0.95: {ev.stats[0]:.4f}\n")
+        f.write(f"Avg latency: {sum(latencies)/len(latencies):.2f} ms\n")
+
+    with open("/workspace/logs/plots/coco_eval.pkl", "wb") as f:
+        pickle.dump({"coco_eval": ev, "results": results}, f)
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 5/6: ГРАФИКИ (тот же 05_plots.py, что в MMDetection)
+# =============================================================================
+COPY <<'PYTHON' /workspace/05_plots.py
+import os, re, pickle
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+PLOTS_DIR = "/workspace/logs/plots"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+# ... (тело plot_training_curves, plot_pr_curves, plot_confusion_matrix,
+#      plot_confidence_profile — идентично MMDetection-контейнеру)
+# См. полный листинг в mmdet_yolox_docker.dockerfile.
+
+if __name__ == "__main__":
+    mode = os.environ.get("PLOT_MODE", "test")
+    if mode == "train":
+        pass  # Detectron2 пишет метрики в TensorBoard, парсинг опционален
+    else:
+        pkl = Path(f"{PLOTS_DIR}/coco_eval.pkl")
+        if pkl.exists():
+            with open(pkl, "rb") as f:
+                data = pickle.load(f)
+            if "coco_eval" in data:
+                plot_pr_curves(data["coco_eval"])
+PYTHON
+
+# =============================================================================
+# ГЛАВНЫЙ PIPELINE
+# =============================================================================
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots /workspace/runs/onnx
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG
+}
+
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "=========================================="
+log "Detectron2 Faster R-CNN Pipeline START"
+log "=========================================="
+
+RUN_NAME=${RUN_NAME:-detectron2_run}
+ONNX_PATH=${ONNX_PATH:-/workspace/runs/onnx/model.onnx}
+export RUN_NAME ONNX_PATH
+
+log "Model: ${MODEL_CFG:-COCO-Detection/faster_rcnn_R_50_FPN_3x.yaml}"
+log ""
+
+CURRENT_STEP="0/6 CONVERT"
+log "STEP 0/6: Converting LabelMe > COCO"
+START=$(date +%s)
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+END=$(date +%s)
+log "STEP 0/6: Conversion finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="1/6 TRAIN"
+log "STEP 1/6: Training started > logs/01_train.log"
+START=$(date +%s)
+python /workspace/01_train.py 2>&1 | tee -a /workspace/logs/01_train.log
+END=$(date +%s)
+log "STEP 1/6: Training finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="2/6 TEST PTH"
+log "STEP 2/6: Testing .pth"
+START=$(date +%s)
+python /workspace/02_test_pth.py 2>&1 | tee -a /workspace/logs/02_test_pth.log
+END=$(date +%s)
+log "STEP 2/6: Testing .pth finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="3/6 EXPORT ONNX"
+log "STEP 3/6: Exporting to ONNX"
+START=$(date +%s)
+python /workspace/03_export_onnx.py 2>&1 | tee -a /workspace/logs/03_export.log
+END=$(date +%s)
+log "STEP 3/6: Export finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="4/6 TEST ONNX"
+log "STEP 4/6: Testing .onnx"
+START=$(date +%s)
+python /workspace/04_test_onnx.py 2>&1 | tee -a /workspace/logs/04_test_onnx.log
+END=$(date +%s)
+log "STEP 4/6: Testing .onnx finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="5/6 PLOTS"
+log "STEP 5/6: Generating plots..."
+START=$(date +%s)
+python /workspace/05_plots.py 2>&1 | tee -a $MASTER_LOG
+END=$(date +%s)
+log "STEP 5/6: Plots finished in $((END-START))s"
+log ""
+
+log "=========================================="
+log "Pipeline COMPLETE"
+log "Final ONNX: ${ONNX_PATH}"
+log "Logs: /workspace/logs/"
+log "=========================================="
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

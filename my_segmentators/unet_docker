@@ -1,0 +1,274 @@
+# =============================================================================
+# unet_docker.dockerfile
+# U-Net (Apache 2.0, MMSegmentation v0.30.0) — semantic segmentation.
+#
+# АРХИТЕКТУРА:
+#   Encoder-decoder с skip connections. Классическая U-образная форма.
+#
+# ПОЧЕМУ U-Net:
+#   - Лёгкая (17.91 GB памяти для обучения на Cityscapes)
+#   - Хороша для медицинских и промышленных задач с малым числом классов
+#   - Готовая реализация в MMSegmentation: configs/unet/
+#   - fcn_unet_s5-d16_4x4_512x1024_160k_cityscapes — базовая конфигурация [citation:32]
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ:
+#   MMSegmentation v0.30.0 + mmcv-full 1.7.0 + torch 1.10.0 + cu113.
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+RUN git clone -b 'v0.30.0' https://github.com/open-mmlab/mmsegmentation.git . \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir mmdet==2.27.0
+
+RUN pip install --no-cache-dir pybind11 onnxruntime onnx onnxsim \
+    && git clone -b 'v0.12.0' https://github.com/open-mmlab/mmdeploy.git /workspace/mmdeploy \
+    && cd /workspace/mmdeploy && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    scikit-learn lxml \
+    pycocotools supervision \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmsegmentation/data /workspace/work_dirs
+
+COPY <<'PYTHON' /workspace/00_convert.py
+"""LabelMe JSON > PNG masks для MMSegmentation."""
+import os, sys, glob, json, shutil
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+OUT_DIR = os.environ.get("MMSEG_DATA_DIR", "/workspace/mmsegmentation/data/nlmk_seg")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.05"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+
+def make_masks(json_files, label_list, img_dir, ann_dir):
+    os.makedirs(img_dir, exist_ok=True)
+    os.makedirs(ann_dir, exist_ok=True)
+    for fname in json_files:
+        base = os.path.splitext(os.path.basename(fname))[0]
+        src_dir = os.path.dirname(fname)
+        jpeg_in = os.path.join(src_dir, base + '.jpg')
+        jpeg_out = os.path.join(img_dir, base + '.jpg')
+        if os.path.exists(jpeg_in):
+            shutil.copy2(jpeg_in, jpeg_out)
+        img = cv2.imread(jpeg_out)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        with open(fname, encoding='utf-8') as f:
+            data = json.load(f)
+        for shape in data.get('shapes', []):
+            label = shape['label']
+            if label not in label_list:
+                continue
+            cls_id = label_list.index(label) + 1
+            pts = np.array(shape['points']).astype(np.int32)
+            cv2.fillPoly(mask, [pts], cls_id)
+        cv2.imwrite(os.path.join(ann_dir, base + '.png'), mask)
+    print(f"[OK] {len(json_files)} images > {img_dir}")
+
+def find_subfolders(root):
+    trainval, test = [], []
+    for dp, dn, fn in os.walk(root):
+        if not any(f.endswith('.json') for f in fn):
+            continue
+        d = os.path.basename(dp).lower()
+        if 'test' in d:
+            test.append(dp)
+        else:
+            trainval.append(dp)
+    return sorted(trainval), sorted(test)
+
+def main():
+    paths_trainval, paths_test = find_subfolders(DATASETS_DIR)
+    obj_path = os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)
+    if not os.path.exists(obj_path) and paths_trainval:
+        obj_path = os.path.join(paths_trainval[0], OBJ_NAMES_FILE)
+    with open(obj_path) as f:
+        LABEL_LIST = [l.strip() for l in f if l.strip()]
+    print(f"Classes: {LABEL_LIST}")
+
+    trainval_json = []
+    for p in paths_trainval:
+        trainval_json.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+    test_json = []
+    for p in paths_test:
+        test_json.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+
+    train_ids, val_ids = train_test_split(trainval_json, test_size=SPLIT_SIZE,
+                                           random_state=RANDOM_STATE)
+    make_masks(train_ids, LABEL_LIST,
+               os.path.join(OUT_DIR, 'img_dir', 'train'),
+               os.path.join(OUT_DIR, 'ann_dir', 'train'))
+    make_masks(val_ids, LABEL_LIST,
+               os.path.join(OUT_DIR, 'img_dir', 'val'),
+               os.path.join(OUT_DIR, 'ann_dir', 'val'))
+    make_masks(test_json, LABEL_LIST,
+               os.path.join(OUT_DIR, 'img_dir', 'test'),
+               os.path.join(OUT_DIR, 'ann_dir', 'test'))
+    print(f"Train: {len(train_ids)}, Val: {len(val_ids)}, Test: {len(test_json)}")
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== U-Net Training ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmsegmentation
+python tools/train.py ${CONFIG:-configs/unet/unet-s5-d16_fcn_4xb4-160k_cityscapes-512x1024.py} \
+    --work-dir /workspace/work_dirs/${RUN_NAME:-unet}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/02_test_pth.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test_pth.log}
+{
+echo "=== U-Net Test (PTH) ==="
+cd /workspace/mmsegmentation
+python tools/test.py ${CONFIG} ${TRAINED_WEIGHTS} --eval mIoU
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test_pth.sh
+
+COPY <<'SHELL' /workspace/03_export_onnx.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/03_export.log}
+{
+echo "=== U-Net ONNX Export ==="
+cd /workspace/mmsegmentation
+python tools/deployment/pytorch2onnx.py ${CONFIG} ${TRAINED_WEIGHTS} \
+    --output-file ${ONNX_PATH} --shape 512 1024 --verify
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/03_export_onnx.sh
+
+COPY <<'PYTHON' /workspace/04_test_onnx.py
+"""ONNX evaluation for semantic segmentation."""
+import argparse, os, time, pickle
+import cv2
+import numpy as np
+import onnxruntime as ort
+from pathlib import Path
+
+def preprocess(img, imgsz=(512, 1024)):
+    img = cv2.resize(img, imgsz)
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB).astype(np.float32)
+    mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
+    std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
+    img = (img - mean) / std
+    return np.expand_dims(img.transpose(2, 0, 1), axis=0)
+
+def compute_miou(preds, gts, num_classes):
+    ious = []
+    for c in range(1, num_classes + 1):
+        pred_c = (preds == c)
+        gt_c = (gts == c)
+        inter = (pred_c & gt_c).sum()
+        union = (pred_c | gt_c).sum()
+        if union > 0:
+            ious.append(inter / union)
+    return np.mean(ious) if ious else 0.0
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--onnx", default=os.environ.get("ONNX_PATH"))
+    p.add_argument("--images", default="/workspace/mmsegmentation/data/nlmk_seg/img_dir/test")
+    p.add_argument("--masks", default="/workspace/mmsegmentation/data/nlmk_seg/ann_dir/test")
+    p.add_argument("--log", default="/workspace/logs/04_test_onnx.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== U-Net Test (ONNX) ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    session = ort.InferenceSession(args.onnx, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    ious, latencies = [], []
+    for img_path in sorted(Path(args.images).glob("*.jpg")):
+        mask_path = Path(args.masks) / (img_path.stem + ".png")
+        if not mask_path.exists():
+            continue
+        img = cv2.imread(str(img_path))
+        gt = cv2.imread(str(mask_path), cv2.IMREAD_GRAYSCALE)
+        if img is None or gt is None:
+            continue
+        inp = preprocess(img)
+        t0 = time.perf_counter()
+        outputs = session.run(None, {input_name: inp})
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+        pred = np.argmax(outputs[0][0], axis=0)
+        pred = cv2.resize(pred.astype(np.uint8), (gt.shape[1], gt.shape[0]),
+                          interpolation=cv2.INTER_NEAREST)
+        ious.append(compute_miou(pred, gt, int(os.environ.get("NUM_CLASSES", "3"))))
+
+    miou = np.mean(ious) if ious else 0.0
+    with open(args.log, "a") as f:
+        f.write(f"mIoU: {miou:.4f}\n")
+        f.write(f"Avg latency: {sum(latencies)/len(latencies):.2f} ms\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "U-Net Pipeline START"
+CURRENT_STEP="0/6 CONVERT"; log "STEP 0/6: Converting LabelMe > masks"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/6 TRAIN"; log "STEP 1/6: Training"
+bash /workspace/01_train.sh
+
+CURRENT_STEP="2/6 TEST PTH"; log "STEP 2/6: Testing .pth"
+bash /workspace/02_test_pth.sh
+
+CURRENT_STEP="3/6 EXPORT"; log "STEP 3/6: Exporting ONNX"
+bash /workspace/03_export_onnx.sh
+
+CURRENT_STEP="4/6 TEST ONNX"; log "STEP 4/6: Testing .onnx"
+python /workspace/04_test_onnx.py
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

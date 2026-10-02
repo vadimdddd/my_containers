@@ -1,0 +1,220 @@
+# =============================================================================
+# detectron2_keypoint_docker.dockerfile
+# Detectron2 Keypoint R-CNN (Apache 2.0) — keypoint detection.
+#
+# АРХИТЕКТУРА:
+#   Faster R-CNN + KeypointHead (RoIAlign + heatmap regression).
+#
+# ОСОБЕННОСТЬ:
+#   Detectron2 поддерживает только ONE category for keypoints [citation:25][citation:32]
+#   То есть все keypoints принадлежат одному классу объектов.
+#   Для multi-class keypoints используйте MMPose.
+#
+# НАСТРОЙКА:
+#   MODEL.ROI_KEYPOINT_HEAD.NUM_KEYPOINTS = NUM_KEYPOINTS
+#   TEST.KEYPOINT_OKS_SIGMAS = sigmas (для OKS evaluation)
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+# Detectron2 v0.6
+RUN pip install --no-cache-dir detectron2 -f \
+    https://dl.fbaipublicfiles.com/detectron2/wheels/cu113/torch1.10/index.html
+
+RUN pip install --no-cache-dir \
+    pycocotools \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/datasets /workspace/output /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# КОНВЕРТАЦИЯ: LabelMe > COCO Keypoints (с одним category_id=1)
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""
+LabelMe JSON > COCO Keypoints для Detectron2.
+
+ВАЖНО: Detectron2 требует одну категорию для всех keypoints [citation:25]
+"""
+import os, glob, json, shutil
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+COCO_DIR = os.environ.get("COCO_DIR", "/workspace/datasets/coco_kpts")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.2"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+NUM_KEYPOINTS = int(os.environ.get("NUM_KEYPOINTS", "17"))
+
+def convert(json_files, out_path, img_dir):
+    images, annotations = [], []
+    ann_id, img_id = 0, 0
+
+    for jp in json_files:
+        base = os.path.splitext(os.path.basename(jp))[0]
+        jpg = os.path.join(os.path.dirname(jp), base + '.jpg')
+        if not os.path.exists(jpg):
+            continue
+
+        img_out = os.path.join(img_dir, base + '.jpg')
+        shutil.copy2(jpg, img_out)
+        img = cv2.imread(img_out)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        images.append({"id": img_id, "file_name": base + '.jpg',
+                       "width": w, "height": h})
+
+        with open(jp, encoding='utf-8') as f:
+            data = json.load(f)
+
+        for shape in data.get('shapes', []):
+            pts = shape['points']
+            if len(pts) != NUM_KEYPOINTS:
+                continue
+
+            kpts_flat = []
+            for pt in pts:
+                kpts_flat.extend([pt[0], pt[1], 2])
+
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            x_min, y_min = max(0, min(xs)), max(0, min(ys))
+            x_max, y_max = min(w, max(xs)), min(h, max(ys))
+
+            annotations.append({
+                "id": ann_id,
+                "image_id": img_id,
+                "category_id": 1,  # ОДНА категория
+                "keypoints": kpts_flat,
+                "num_keypoints": NUM_KEYPOINTS,
+                "bbox": [int(x_min), int(y_min), int(x_max - x_min), int(y_max - y_min)],
+                "area": int((x_max - x_min) * (y_max - y_min)),
+                "iscrowd": 0,
+            })
+            ann_id += 1
+        img_id += 1
+
+    categories = [{"id": 1, "name": "object",
+                   "keypoints": [f"kp_{i}" for i in range(NUM_KEYPOINTS)],
+                   "skeleton": []}]
+    with open(out_path, 'w') as f:
+        json.dump({"images": images, "annotations": annotations,
+                   "categories": categories}, f)
+    print(f"[OK] {out_path}: {len(images)} images, {len(annotations)} annotations")
+
+def main():
+    for sub in ['train', 'valid', 'test']:
+        os.makedirs(os.path.join(COCO_DIR, sub), exist_ok=True)
+
+    all_json = []
+    for dp, dn, fn in os.walk(DATASETS_DIR):
+        all_json.extend(sorted(glob.glob(os.path.join(dp, '*.json'))))
+
+    train_json, temp = train_test_split(all_json, test_size=SPLIT_SIZE,
+                                          random_state=RANDOM_STATE)
+    val_json, test_json = train_test_split(temp, test_size=0.5,
+                                             random_state=RANDOM_STATE)
+
+    convert(train_json, os.path.join(COCO_DIR, 'train', '_annotations.coco.json'),
+            os.path.join(COCO_DIR, 'train'))
+    convert(val_json, os.path.join(COCO_DIR, 'valid', '_annotations.coco.json'),
+            os.path.join(COCO_DIR, 'valid'))
+    convert(test_json, os.path.join(COCO_DIR, 'test', '_annotations.coco.json'),
+            os.path.join(COCO_DIR, 'test'))
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# ТРЕНИРОВКА: Keypoint R-CNN
+# =============================================================================
+COPY <<'PYTHON' /workspace/01_train.py
+"""
+Detectron2 Keypoint R-CNN training.
+"""
+import os, time
+from detectron2.engine import DefaultTrainer
+from detectron2.config import get_cfg
+from detectron2 import model_zoo
+from detectron2.data.datasets import register_coco_instances
+from detectron2.data import MetadataCatalog
+
+COCO_DIR = os.environ.get("COCO_DIR", "/workspace/datasets/coco_kpts")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/workspace/output")
+NUM_KEYPOINTS = int(os.environ.get("NUM_KEYPOINTS", "17"))
+
+with open("/workspace/logs/01_train.log", "a") as f:
+    f.write(f"=== Detectron2 Keypoint Training ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+    f.write(f"Num keypoints: {NUM_KEYPOINTS}\n")
+
+register_coco_instances("kpts_train", {},
+                        os.path.join(COCO_DIR, "train", "_annotations.coco.json"),
+                        os.path.join(COCO_DIR, "train"))
+register_coco_instances("kpts_valid", {},
+                        os.path.join(COCO_DIR, "valid", "_annotations.coco.json"),
+                        os.path.join(COCO_DIR, "valid"))
+
+# Устанавливаем metadata для keypoints
+MetadataCatalog.get("kpts_train").keypoint_names = [f"kp_{i}" for i in range(NUM_KEYPOINTS)]
+MetadataCatalog.get("kpts_train").keypoint_flip_map = []
+
+cfg = get_cfg()
+cfg.merge_from_file(model_zoo.get_config_file("COCO-Keypoints/keypoint_rcnn_R_50_FPN_3x.yaml"))
+cfg.DATASETS.TRAIN = ("kpts_train",)
+cfg.DATASETS.TEST = ("kpts_valid",)
+cfg.DATALOADER.NUM_WORKERS = 2
+cfg.MODEL.WEIGHTS = model_zoo.get_checkpoint_url("COCO-Keypoints/keypoint_rcnn_R_50_FPN_3x.yaml")
+cfg.SOLVER.IMS_PER_BATCH = int(os.environ.get("BATCH", "2"))
+cfg.SOLVER.BASE_LR = 0.00025
+cfg.SOLVER.MAX_ITER = int(os.environ.get("MAX_ITER", "30000"))
+cfg.MODEL.ROI_HEADS.NUM_CLASSES = 1  # ОДНА категория [citation:25]
+cfg.MODEL.ROI_KEYPOINT_HEAD.NUM_KEYPOINTS = NUM_KEYPOINTS
+cfg.TEST.KEYPOINT_OKS_SIGMAS = [0.05] * NUM_KEYPOINTS
+cfg.OUTPUT_DIR = OUTPUT_DIR
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+trainer = DefaultTrainer(cfg)
+trainer.resume_or_load(resume=False)
+trainer.train()
+
+with open("/workspace/logs/01_train.log", "a") as f:
+    f.write("Training complete.\n")
+PYTHON
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "Detectron2 Keypoint Pipeline START"
+CURRENT_STEP="0/2 CONVERT"; log "STEP 0/2: Converting LabelMe > COCO Keypoints"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/2 TRAIN"; log "STEP 1/2: Training Keypoint R-CNN"
+python /workspace/01_train.py 2>&1 | tee -a /workspace/logs/01_train.log
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

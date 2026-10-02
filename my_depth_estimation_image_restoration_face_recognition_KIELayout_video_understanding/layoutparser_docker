@@ -1,0 +1,92 @@
+# =============================================================================
+# layoutparser_docker.dockerfile
+# LayoutParser (Apache 2.0) — document layout analysis.
+#
+# ЧТО ЭТО:
+#   LayoutParser — тулкит для анализа структуры документов.
+#   Определяет блоки: заголовки, параграфы, таблицы, изображения.
+#   Лицензия Apache 2.0 [citation:5][citation:12].
+#
+# МОДЕЛИ:
+#   Detectron2 (PubLayNet), YOLOX (DocLayNet), Table Transformer [citation:5]
+# =============================================================================
+
+FROM pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+RUN pip install --no-cache-dir \
+    layoutparser \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    Pillow
+
+RUN mkdir -p /workspace/images /workspace/runs /workspace/logs
+
+COPY <<'PYTHON' /workspace/inference.py
+"""
+LayoutParser inference: document layout analysis.
+"""
+import os, time, argparse
+import cv2
+import layoutparser as lp
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--input", required=True)
+    p.add_argument("--output", default="/workspace/runs/layout")
+    p.add_argument("--log", default="/workspace/logs/layout.log")
+    args = p.parse_args()
+
+    os.makedirs(args.output, exist_ok=True)
+
+    with open(args.log, "a") as f:
+        f.write(f"=== LayoutParser Inference ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    # Загрузка модели (Detectron2 PubLayNet)
+    model = lp.Detectron2LayoutModel(
+        config_path='lp://PubLayNet/faster_rcnn_R_50_FPN_3x/config',
+        label_map={0: "Text", 1: "Title", 2: "List", 3: "Table", 4: "Figure"},
+        extra_config=["MODEL.ROI_HEADS.SCORE_THRESH_TEST", 0.8],
+    )
+
+    if os.path.isdir(args.input):
+        images = sorted([os.path.join(args.input, f)
+                         for f in os.listdir(args.input)
+                         if f.endswith(('.jpg', '.jpeg', '.png'))])
+    else:
+        images = [args.input]
+
+    for img_path in images:
+        base = os.path.splitext(os.path.basename(img_path))[0]
+        image = cv2.imread(img_path)
+        if image is None:
+            continue
+
+        t0 = time.perf_counter()
+        layout = model.detect(image)
+        latency = (time.perf_counter() - t0) * 1000
+
+        # Визуализация
+        vis = lp.draw_box(image, layout, box_width=3, show_element_type=True)
+        vis.save(os.path.join(args.output, base + "_layout.png"))
+
+        with open(args.log, "a") as f:
+            f.write(f"{base}: {len(layout)} blocks, {latency:.2f} ms\n")
+
+        print(f"{base}: {len(layout)} blocks")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

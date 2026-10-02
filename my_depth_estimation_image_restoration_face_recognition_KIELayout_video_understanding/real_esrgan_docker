@@ -1,0 +1,102 @@
+# =============================================================================
+# real_esrgan_docker.dockerfile
+# Real-ESRGAN (Apache 2.0, MMagic) Ч image restoration / super-resolution.
+#
+# „“ќ Ё“ќ:
+#   Real-ESRGAN Ч blind super-resolution дл€ real-world изображений.
+#   ќбучен на синтетических деградаци€х, работает с шумом, blur, JPEG artifacts.
+#
+# ј–’»“≈ “”–ј:
+#   Generator: RRDB (Residual-in-Residual Dense Block)
+#   Discriminator: U-Net с spectral normalization 
+#
+# Ћ»÷≈Ќ«»я: Apache 2.0 (MMagic)
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+# MMagic (бывший MMEditing)
+RUN git clone -b 'v1.0.0' https://github.com/open-mmlab/mmagic.git . \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/images /workspace/runs /workspace/logs /workspace/work_dirs
+
+# =============================================================================
+# »Ќ‘≈–≈Ќ—: Real-ESRGAN
+# =============================================================================
+COPY <<'SHELL' /workspace/inference.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/inference.log}
+{
+echo "=== Real-ESRGAN Inference ==="
+echo "Timestamp: $(date)"
+echo "Input: ${INPUT_DIR}"
+echo "Output: ${OUTPUT_DIR}"
+echo "---"
+
+cd /workspace
+python demo/restoration_demo.py \
+    configs/real_esrgan/realesrgan_c64b23g32_4xb12-lr1e-4-400k_df2k-ost.py \
+    https://download.openmmlab.com/mmediting/restorers/real_esrgan/realesrgan_c64b23g32_12x4_lr1e-4_400k_df2k_ost_20211010-34798885.pth \
+    ${INPUT_DIR} \
+    ${OUTPUT_DIR} \
+    --imshow=False
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/inference.sh
+
+# =============================================================================
+# “–≈Ќ»–ќ¬ ј (опционально, если есть пары low-res / high-res)
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== Real-ESRGAN Training ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmagic
+python tools/train.py ${CONFIG:-configs/real_esrgan/realesrgan_c64b23g32_4xb12-lr1e-4-400k_df2k-ost.py} \
+    --work-dir /workspace/work_dirs/${RUN_NAME:-real_esrgan}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "Real-ESRGAN Pipeline START"
+CURRENT_STEP="1/2 INFERENCE"; log "STEP 1/2: Running inference"
+bash /workspace/inference.sh
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/bin/bash"]

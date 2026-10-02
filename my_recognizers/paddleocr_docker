@@ -1,0 +1,166 @@
+# =============================================================================
+# paddleocr_docker.dockerfile
+# PaddleOCR (Apache 2.0) — детекция + распознавание текста.
+#
+# НАЗНАЧЕНИЕ:
+#   - Традиционный OCR-пайплайн: DB-детектор + CRNN/SVTR-распознаватель.
+#   - Мультиязычность (80+ языков).
+#   - Экспорт в ONNX/TensorRT.
+#
+# ЛИЦЕНЗИЯ:
+#   Apache 2.0.
+# =============================================================================
+
+FROM paddlepaddle/paddle:3.0.0-gpu-cuda11.8-cudnn8.9-trt8.6
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Установка PaddleOCR
+RUN pip install --no-cache-dir paddleocr
+
+# Дополнительные зависимости
+RUN pip install --no-cache-dir \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    onnxruntime-gpu
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# СТАДИЯ 0: КОНВЕРТАЦИЯ ДАТАСЕТА
+#   LabelMe JSON > формат PaddleOCR (det + rec)
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""
+LabelMe JSON > формат PaddleOCR.
+
+Для детекции: images + txt-файлы с координатами.
+Для распознавания: crop-изображения + текстовые метки.
+"""
+import os, sys, glob, json, shutil
+import cv2
+import numpy as np
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+OUT_DIR = os.environ.get("PADDLE_DATA_DIR", "/workspace/paddle_data")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+
+def main():
+    det_dir = os.path.join(OUT_DIR, "det")
+    rec_dir = os.path.join(OUT_DIR, "rec")
+    os.makedirs(os.path.join(det_dir, "images"), exist_ok=True)
+    os.makedirs(os.path.join(det_dir, "annotations"), exist_ok=True)
+    os.makedirs(os.path.join(rec_dir, "images"), exist_ok=True)
+
+    # Находим все JSON
+    json_files = []
+    for dp, dn, fn in os.walk(DATASETS_DIR):
+        if any(f.endswith('.json') for f in fn):
+            json_files.extend(sorted(glob.glob(os.path.join(dp, '*.json'))))
+
+    with open("/workspace/logs/00_convert.log", "a") as log:
+        log.write(f"Found {len(json_files)} JSON files\n")
+
+    # Детекция: images + txt с bbox
+    for fname in json_files:
+        base = os.path.splitext(os.path.basename(fname))[0]
+        src_dir = os.path.dirname(fname)
+        jpeg_in = os.path.join(src_dir, base + '.jpg')
+        jpeg_out = os.path.join(det_dir, "images", base + '.jpg')
+        if os.path.exists(jpeg_in):
+            shutil.copy2(jpeg_in, jpeg_out)
+
+        img = cv2.imread(jpeg_out)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        with open(fname, encoding='utf-8') as f:
+            data = json.load(f)
+
+        txt_lines = []
+        for shape in data.get('shapes', []):
+            pts = np.array(shape['points']).astype(int)
+            x_min, y_min = np.min(pts, axis=0)
+            x_max, y_max = np.max(pts, axis=0)
+            x_min = max(0, min(x_min, w))
+            x_max = max(0, min(x_max, w))
+            y_min = max(0, min(y_min, h))
+            y_max = max(0, min(y_max, h))
+            # Формат PaddleOCR det: x1,y1,x2,y2,x3,y3,x4,y4,text
+            txt_lines.append(f"{x_min},{y_min},{x_max},{y_min},{x_max},{y_max},{x_min},{y_max},{shape['label']}")
+
+        with open(os.path.join(det_dir, "annotations", base + '.txt'), 'w') as f:
+            f.write("\n".join(txt_lines))
+
+    print(f"[OK] Detection data: {det_dir}")
+    print(f"Для распознавания: используйте crop-изображения из annotations")
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 1: ТРЕНИРОВКА (детекция или распознавание)
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== PaddleOCR Training ==="
+echo "Timestamp: $(date)"
+echo "Task: ${TASK:-det}"
+echo "---"
+
+if [ "${TASK:-det}" = "det" ]; then
+    python tools/train.py -c configs/det/${CONFIG:-det_r50_db_v2.yml} \
+        -o Global.save_model_dir=/workspace/runs/paddle_det
+else
+    python tools/train.py -c configs/rec/${CONFIG:-rec_crnn.yml} \
+        -o Global.save_model_dir=/workspace/runs/paddle_rec
+fi
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+COPY <<'SHELL' /workspace/02_test.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test.log}
+{
+echo "=== PaddleOCR Test ==="
+cd /workspace/PaddleOCR
+python tools/eval.py -c configs/${TASK:-det}/${CONFIG} \
+    -o Global.checkpoints=${CHECKPOINT}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test.sh
+
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG; }
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "PaddleOCR Pipeline START"
+CURRENT_STEP="0/4 CONVERT"; log "STEP 0/4: Converting LabelMe > Paddle format"
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+
+CURRENT_STEP="1/4 TRAIN"; log "STEP 1/4: Training"
+bash /workspace/01_train.sh
+
+CURRENT_STEP="2/4 TEST"; log "STEP 2/4: Testing"
+bash /workspace/02_test.sh
+
+log "Pipeline COMPLETE"
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

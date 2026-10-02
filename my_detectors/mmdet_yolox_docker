@@ -1,0 +1,1168 @@
+# =============================================================================
+# mmdet_yolox_docker.dockerfile
+# MMDetection v2.27.0 — модульный пайплайн: backbone + neck + head собираются
+# из env-переменных. Дефолт — YOLOX-S (CSPDarknet + YOLOXPAFPN + YOLOXHead).
+#
+#   convert > train > test .pth > export .onnx > test .onnx > plots
+#
+# ЗАЧЕМ ЭТОТ ОБРАЗ:
+#   Один `docker run` выполняет все 6 стадий. Если CONFIG не задан — собирает
+#   конфиг из BACKBONE + NECK + HEAD. Если задан — использует готовый конфиг.
+#
+# ЛИЦЕНЗИЯ:
+#   Apache 2.0 на код и веса. Можно в закрытых коммерческих продуктах.
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ:
+#   MMDetection 2.27.0 + mmcv-full 1.7.0 + torch 1.10.0 + cu113.
+#   mmdeploy 0.12.0 — для экспорта YOLOX в ONNX (обход bbox_coder).
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+# -----------------------------------------------------------------------------
+# СИСТЕМНЫЕ ЗАВИСИМОСТИ
+#   git, wget — клонирование репо и скачивание весов
+#   libgl1, libglib2.0-0, libsm6, libxext6, libxrender-dev — OpenCV
+#   gcc, g++, ninja-build — сборка mmcv-full/mmdeploy из исходников
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# -----------------------------------------------------------------------------
+# ФИКСАЦИЯ TORCHVISION ПОД CUDA 11.3
+#   MMDetection использует torchvision.ops.nms и box_iou.
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+# -----------------------------------------------------------------------------
+# MMCV-FULL 1.7.0 (из wheel-репозитория OpenMMLab)
+#
+# ЗАЧЕМ: ядро OpenMMLab с CUDA-операторами (NMS, RoIAlign, deform_conv).
+# ОТКУДА: официальный репозиторий под torch1.10.0 + cu113 .
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+# -----------------------------------------------------------------------------
+# MMDETECTION v2.27.0
+#
+# ЗАЧЕМ: официальный репозиторий. Содержит tools/train.py, tools/test.py,
+#        configs/yolox/, tools/dataset_converters/pascal_voc.py.
+# -----------------------------------------------------------------------------
+RUN git clone -b 'v2.27.0' https://github.com/open-mmlab/mmdetection.git . \
+    && pip install --no-cache-dir -v -e .
+
+# -----------------------------------------------------------------------------
+# MMDEPLOY v0.12.0 (для экспорта YOLOX в ONNX)
+#
+# ЗАЧЕМ: прямой экспорт через pytorch2onnx.py падает с bbox_coder.
+#        mmdeploy имеет исправленный пайплайн для YOLOX.
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir pybind11 onnxruntime onnx onnxsim \
+    && git clone -b 'v0.12.0' https://github.com/open-mmlab/mmdeploy.git /workspace/mmdeploy \
+    && cd /workspace/mmdeploy && pip install --no-cache-dir -v -e .
+
+# -----------------------------------------------------------------------------
+# ДОПОЛНИТЕЛЬНЫЕ ЗАВИСИМОСТИ ДЛЯ КОНВЕРТАЦИИ, ТЕСТА И ГРАФИКОВ
+#   scikit-learn — train_test_split в скрипте конвертации
+#   lxml — для парсинга XML
+#   pycocotools — COCOeval
+#   supervision — confusion matrix
+#   matplotlib, seaborn, pandas — графики
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    scikit-learn lxml \
+    pycocotools supervision \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+# -----------------------------------------------------------------------------
+# ДИРЕКТОРИИ ДЛЯ МОНТИРОВАНИЯ
+#   /workspace/datasets — исходные LabelMe JSON+JPG (монтируется)
+#   /workspace/mmdetection/data — VOC+COCO, генерируемые скриптом
+#   /workspace/work_dirs — чекпоинты
+#   /workspace/runs — ONNX + промежуточные артефакты
+#   /workspace/logs — логи и графики
+# -----------------------------------------------------------------------------
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmdetection/data /workspace/work_dirs /workspace/configs_generated
+
+# =============================================================================
+# ГЕНЕРАТОР КОНФИГОВ (argparse)
+#
+# ЧТО ДЕЛАЕТ:
+#   Собирает .py-конфиг MMDetection из выбранных BACKBONE + NECK + HEAD.
+#   Если CONFIG задан через env — ничего не генерирует, использует готовый.
+#
+# ПОДДЕРЖИВАЕМЫЕ КОМБИНАЦИИ:
+#   BACKBONE: CSPDarknet | ResNet | SwinTransformer | HRNet
+#   NECK:     YOLOXPAFPN | FPN | PAFPN | NASFPN
+#   HEAD:     YOLOXHead | FCOSHead | ATSSHead | RetinaHead
+#
+# ДЕФОЛТ: CSPDarknet + YOLOXPAFPN + YOLOXHead = YOLOX-S
+# =============================================================================
+COPY <<'PYTHON' /workspace/generate_config.py
+"""
+Генератор конфигов MMDetection из BACKBONE + NECK + HEAD.
+Если CONFIG задан — возвращает его как есть (обратная совместимость).
+"""
+import argparse
+import os
+import sys
+from pathlib import Path
+
+
+BACKBONE_TEMPLATES = {
+    "CSPDarknet": dict(
+        type="CSPDarknet",
+        deepen_factor=0.33,
+        widen_factor=0.50,
+        out_indices=(2, 3, 4),
+        use_depthwise=False,
+        arch="P5",
+        norm_cfg=dict(type="BN", momentum=0.03, eps=0.001),
+        act_cfg=dict(type="Swish"),
+    ),
+    "ResNet": dict(
+        type="ResNet",
+        depth=50,
+        num_stages=4,
+        out_indices=(1, 2, 3),
+        frozen_stages=-1,
+        norm_cfg=dict(type="BN", requires_grad=True),
+        norm_eval=True,
+        style="pytorch",
+    ),
+    "SwinTransformer": dict(
+        type="SwinTransformer",
+        embed_dim=96,
+        depths=[2, 2, 6, 2],
+        num_heads=[3, 6, 12, 24],
+        window_size=7,
+        ape=False,
+        drop_path_rate=0.2,
+        patch_norm=True,
+        out_indices=(1, 2, 3),
+        use_checkpoint=False,
+    ),
+    "HRNet": dict(
+        type="HRNet",
+        extra=dict(
+            stage1=dict(num_modules=1, num_branches=1,
+                        block="BOTTLENECK",
+                        num_blocks=(4,), num_channels=(64,)),
+            stage2=dict(num_modules=1, num_branches=2,
+                        block="BASIC",
+                        num_blocks=(4, 4),
+                        num_channels=(48, 96)),
+            stage3=dict(num_modules=4, num_branches=3,
+                        block="BASIC",
+                        num_blocks=(4, 4, 4),
+                        num_channels=(48, 96, 192)),
+            stage4=dict(num_modules=3, num_branches=4,
+                        block="BASIC",
+                        num_blocks=(4, 4, 4, 4),
+                        num_channels=(48, 96, 192, 384)),
+        ),
+        in_channels=48,
+        out_indices=(0, 1, 2, 3),
+    ),
+}
+
+NECK_TEMPLATES = {
+    "YOLOXPAFPN": dict(
+        type="YOLOXPAFPN",
+        in_channels=[128, 256, 512],
+        out_channels=128,
+        num_csp_blocks=1,
+        use_depthwise=False,
+        upsample_cfg=dict(scale_factor=2, mode="nearest"),
+        norm_cfg=dict(type="BN", momentum=0.03, eps=0.001),
+        act_cfg=dict(type="Swish"),
+    ),
+    "FPN": dict(
+        type="FPN",
+        in_channels=[512, 1024, 2048],
+        out_channels=256,
+        num_outs=5,
+    ),
+    "PAFPN": dict(
+        type="PAFPN",
+        in_channels=[512, 1024, 2048],
+        out_channels=256,
+        num_outs=5,
+    ),
+    "NASFPN": dict(
+        type="NASFPN",
+        in_channels=[512, 1024, 2048],
+        out_channels=256,
+        stack_times=2,
+        num_outs=5,
+    ),
+}
+
+HEAD_TEMPLATES = {
+    "YOLOXHead": dict(
+        type="YOLOXHead",
+        num_classes=3,
+        in_channels=128,
+        stacked_convs=2,
+        feat_channels=128,
+        use_depthwise=False,
+        strides=[8, 16, 32],
+        act_cfg=dict(type="Swish"),
+        norm_cfg=dict(type="BN", momentum=0.03, eps=0.001),
+        loss_cls=dict(type="CrossEntropyLoss", use_sigmoid=True,
+                      reduction="sum", loss_weight=1.0),
+        loss_bbox=dict(type="IoULoss", mode="square", eps=1e-16,
+                       reduction="sum", loss_weight=5.0),
+        loss_obj=dict(type="CrossEntropyLoss", use_sigmoid=True,
+                      reduction="sum", loss_weight=1.0),
+        loss_l1=dict(type="L1Loss", reduction="sum", loss_weight=1.0),
+    ),
+    "FCOSHead": dict(
+        type="FCOSHead",
+        num_classes=3,
+        in_channels=256,
+        stacked_convs=4,
+        feat_channels=256,
+        strides=[8, 16, 32, 64, 128],
+        loss_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0,
+                      alpha=0.25, loss_weight=1.0),
+        loss_bbox=dict(type="IoULoss", loss_weight=1.0),
+        loss_centerness=dict(type="CrossEntropyLoss", use_sigmoid=True,
+                             loss_weight=1.0),
+    ),
+    "ATSSHead": dict(
+        type="ATSSHead",
+        num_classes=3,
+        in_channels=256,
+        stacked_convs=4,
+        feat_channels=256,
+        strides=[8, 16, 32, 64, 128],
+        loss_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0,
+                      alpha=0.25, loss_weight=1.0),
+        loss_bbox=dict(type="GIoULoss", loss_weight=2.0),
+        loss_centerness=dict(type="CrossEntropyLoss", use_sigmoid=True,
+                             loss_weight=1.0),
+    ),
+    "RetinaHead": dict(
+        type="RetinaHead",
+        num_classes=3,
+        in_channels=256,
+        stacked_convs=4,
+        feat_channels=256,
+        anchor_generator=dict(
+            type="AnchorGenerator",
+            octave_base_scale=4,
+            scales_per_octave=3,
+            ratios=[0.5, 1.0, 2.0],
+            strides=[8, 16, 32, 64, 128],
+        ),
+        loss_cls=dict(type="FocalLoss", use_sigmoid=True, gamma=2.0,
+                      alpha=0.25, loss_weight=1.0),
+        loss_bbox=dict(type="SmoothL1Loss", beta=0.11, loss_weight=1.0),
+    ),
+}
+
+DETECTOR_BY_HEAD = {
+    "YOLOXHead": "YOLOX",
+    "FCOSHead": "FCOS",
+    "ATSSHead": "ATSS",
+    "RetinaHead": "RetinaNet",
+}
+
+
+def render_dict(d, indent=0):
+    """Рекурсивный рендер dict в python-литерал с отступами."""
+    pad = "    " * indent
+    lines = ["{"]
+    for k, v in d.items():
+        if isinstance(v, dict):
+            rendered = render_dict(v, indent + 1)
+            lines.append(f"{pad}    '{k}': {rendered},")
+        elif isinstance(v, (list, tuple)):
+            lines.append(f"{pad}    '{k}': {list(v)},")
+        else:
+            lines.append(f"{pad}    '{k}': {v!r},")
+    lines.append(f"{pad}}}")
+    return "\n".join(lines)
+
+
+def generate(args):
+    backbone = BACKBONE_TEMPLATES[args.backbone].copy()
+    neck = NECK_TEMPLATES[args.neck].copy()
+    head = HEAD_TEMPLATES[args.head].copy()
+
+    # Согласование размерностей (упрощённо для дефолтных случаев)
+    if args.backbone == "CSPDarknet":
+        neck["in_channels"] = [128, 256, 512]
+        neck["out_channels"] = 128
+        head["in_channels"] = 128
+    elif args.backbone == "ResNet":
+        neck["in_channels"] = [512, 1024, 2048]
+        neck["out_channels"] = 256
+        head["in_channels"] = 256
+    elif args.backbone == "SwinTransformer":
+        neck["in_channels"] = [192, 384, 768]
+        neck["out_channels"] = 256
+        head["in_channels"] = 256
+    elif args.backbone == "HRNet":
+        neck["in_channels"] = [48, 96, 192, 384]
+        neck["out_channels"] = 256
+        head["in_channels"] = 256
+
+    head["num_classes"] = args.num_classes
+
+    detector_type = DETECTOR_BY_HEAD[args.head]
+
+    # Сохраняем в файл
+    out_path = Path("/workspace/configs_generated/generated_config.py")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    config_body = f"""# Автоматически сгенерированный конфиг MMDetection
+# BACKBONE = {args.backbone}
+# NECK     = {args.neck}
+# HEAD     = {args.head}
+# NUM_CLASSES = {args.num_classes}
+# DATASET_TYPE = {args.dataset_type}
+
+dataset_type = '{args.dataset_type}'
+data_root = '{args.data_root}'
+classes = {list(args.classes)}
+
+img_norm_cfg = dict(mean=[0, 0, 0], std=[1, 1, 1], to_rgb=True)
+img_scale = ({args.img_size}, {args.img_size})
+
+model = dict(
+    type='{detector_type}',
+    backbone={render_dict(backbone, 1)},
+    neck={render_dict(neck, 1)},
+    bbox_head={render_dict(head, 1)},
+    train_cfg=dict(assigner=dict(type='SimOTAAssigner', center_radius=2.5)),
+    test_cfg=dict(score_thr=0.01, nms=dict(type='nms', iou_threshold=0.65)),
+)
+
+# Пайплайны, датасеты, расписание — стандартные для YOLOX/MMDetection
+train_pipeline = [
+    dict(type='Mosaic', img_scale=img_scale, pad_val=114.0),
+    dict(type='RandomAffine', scaling_ratio_range=(0.5, 1.5),
+         border=(-img_scale[0] // 2, -img_scale[1] // 2)),
+    dict(type='MixUp', ratio_range=(0.8, 1.6), pad_val=114.0),
+    dict(type='YOLOXHSVRandomAug'),
+    dict(type='RandomFlip', flip_ratio=0.5),
+    dict(type='Resize', img_scale=img_scale, keep_ratio=True),
+    dict(type='Pad', size_divisor=32, pad_val=dict(img=(114.0, 114.0, 114.0))),
+    dict(type='Normalize', **img_norm_cfg),
+    dict(type='FilterAnnotations', min_gt_bbox_wh=(1, 1), keep_empty=False),
+    dict(type='DefaultFormatBundle'),
+    dict(type='Collect', keys=['img', 'gt_bboxes', 'gt_labels']),
+]
+
+test_pipeline = [
+    dict(type='LoadImageFromFile'),
+    dict(type='MultiScaleFlipAug', img_scale=img_scale,
+         flip=False, transforms=[
+            dict(type='Resize', keep_ratio=True),
+            dict(type='RandomFlip'),
+            dict(type='Pad', size_divisor=32,
+                 pad_val=dict(img=(114.0, 114.0, 114.0))),
+            dict(type='Normalize', **img_norm_cfg),
+            dict(type='ImageToTensor', keys=['img']),
+            dict(type='Collect', keys=['img']),
+         ]),
+]
+
+data = dict(
+    samples_per_gpu={args.batch},
+    workers_per_gpu={args.workers},
+    train=dict(type=dataset_type, classes=classes,
+               ann_file=f'{{data_root}}/annotations/trainval.json',
+               img_prefix=f'{{data_root}}/train/',
+               pipeline=train_pipeline),
+    val=dict(type=dataset_type, classes=classes,
+             ann_file=f'{{data_root}}/annotations/test.json',
+             img_prefix=f'{{data_root}}/test/',
+             pipeline=test_pipeline),
+    test=dict(type=dataset_type, classes=classes,
+              ann_file=f'{{data_root}}/annotations/test.json',
+              img_prefix=f'{{data_root}}/test/',
+              pipeline=test_pipeline),
+)
+
+optimizer = dict(type='SGD', lr=0.01, momentum=0.9, weight_decay=0.0005)
+lr_config = dict(policy='step', warmup='linear',
+                 warmup_iters=1000, warmup_ratio=0.001,
+                 step=[{args.epochs - 15}, {args.epochs - 5}])
+runner = dict(type='EpochBasedRunner', max_epochs={args.epochs})
+evaluation = dict(interval=10, metric='bbox')
+checkpoint_config = dict(interval=10)
+log_config = dict(interval=50, hooks=[dict(type='TextLoggerHook')])
+total_epochs = {args.epochs}
+"""
+
+    out_path.write_text(config_body)
+    print(f"[OK] Generated config: {out_path}")
+    print(f"     BACKBONE = {args.backbone}")
+    print(f"     NECK     = {args.neck}")
+    print(f"     HEAD     = {args.head}")
+    print(f"     DETECTOR = {detector_type}")
+    return str(out_path)
+
+
+def main():
+    p = argparse.ArgumentParser(description="MMDetection config generator")
+    p.add_argument("--config", default=os.environ.get("CONFIG", ""),
+                   help="Готовый конфиг. Если задан — генерация пропускается.")
+    p.add_argument("--backbone", default=os.environ.get("BACKBONE", "CSPDarknet"),
+                   choices=list(BACKBONE_TEMPLATES.keys()))
+    p.add_argument("--neck", default=os.environ.get("NECK", "YOLOXPAFPN"),
+                   choices=list(NECK_TEMPLATES.keys()))
+    p.add_argument("--head", default=os.environ.get("HEAD", "YOLOXHead"),
+                   choices=list(HEAD_TEMPLATES.keys()))
+    p.add_argument("--num-classes", type=int,
+                   default=int(os.environ.get("NUM_CLASSES", "3")))
+    p.add_argument("--classes", nargs="+",
+                   default=os.environ.get("CLASSES", "class1 class2 class3").split())
+    p.add_argument("--epochs", type=int,
+                   default=int(os.environ.get("EPOCHS", "300")))
+    p.add_argument("--batch", type=int,
+                   default=int(os.environ.get("BATCH", "8")))
+    p.add_argument("--workers", type=int,
+                   default=int(os.environ.get("WORKERS", "4")))
+    p.add_argument("--img-size", type=int,
+                   default=int(os.environ.get("IMG_SIZE", "640")))
+    p.add_argument("--dataset-type",
+                   default=os.environ.get("DATASET_TYPE", "CocoDataset"))
+    p.add_argument("--data-root",
+                   default=os.environ.get("DATA_ROOT",
+                                         "/workspace/mmdetection/data/VOC2007"))
+    args = p.parse_args()
+
+    # Обратная совместимость: если CONFIG задан — используем его
+    if args.config:
+        print(f"[INFO] CONFIG is set, using existing config: {args.config}")
+        print(args.config)
+        return
+
+    # Иначе — генерируем
+    generate(args)
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 0/6: КОНВЕРТАЦИЯ ДАТАСЕТА (LabelMe > VOC > COCO)
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+"""LabelMe JSON > Pascal VOC XML для MMDetection."""
+import os, sys, glob, shutil, json
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+import xml.etree.ElementTree as ET
+from xml.dom import minidom
+
+
+DATASETS_DIR = os.environ.get("DATASETS_DIR", "/workspace/datasets")
+WORK_DIR = os.environ.get("MMDET_DATA_DIR", "/workspace/mmdetection/data")
+DATA_MAIN_FOLDER = os.environ.get("DATA_MAIN_FOLDER", "nlmk_dp_data")
+OBJ_NAMES_FILE = os.environ.get("OBJ_NAMES_FILE", "obj.names")
+SPLIT_SIZE = float(os.environ.get("SPLIT_SIZE", "0.05"))
+RANDOM_STATE = int(os.environ.get("RANDOM_STATE", "42"))
+
+DATABASE_NAME = 'NLMK CHVK VOC Database'
+ANNOTATION_NAME = 'VOC'
+IMAGE_NAME = 'flickr'
+FLICKRID_NAME = '0'
+
+PATH_TO = os.path.join(WORK_DIR, DATA_MAIN_FOLDER)
+PATH_TO_ANNO = os.path.join(PATH_TO, 'Annotations')
+PATH_TO_ISET = os.path.join(PATH_TO, 'ImageSets', 'Main')
+PATH_TO_IMGS = os.path.join(PATH_TO, 'JPEGImages')
+
+
+def get_filename_without_extension(filename):
+    return os.path.splitext(os.path.basename(filename))[0]
+
+
+def make_empty_folder(out_path):
+    if not os.path.exists(out_path):
+        os.makedirs(out_path)
+    for f in glob.glob(os.path.join(out_path, '*.*')):
+        os.remove(f)
+
+
+def correct_box_coords(x1y1x2y2, h, w):
+    x1, y1, x2, y2 = x1y1x2y2
+    c = False
+    if x1 < 0: x1 = 0; c = True
+    if x1 > w: x1 = w; c = True
+    if x2 < 0: x2 = 0; c = True
+    if x2 > w: x2 = w; c = True
+    if y1 < 0: y1 = 0; c = True
+    if y1 > h: y1 = h; c = True
+    if y2 < 0: y2 = 0; c = True
+    if y2 > h: y2 = h; c = True
+    if x1 > x2: x2, x1 = x1, x2; c = True
+    if y1 > y2: y2, y1 = y1, y2; c = True
+    return [x1, y1, x2, y2]
+
+
+def pretty_print_xml(elem):
+    rough_string = ET.tostring(elem, 'utf-8')
+    reparsed = minidom.parseString(rough_string)
+    reparsed = reparsed.toprettyxml(indent='  ')
+    reparsed = reparsed.replace('<?xml version="1.0" ?>', '<?xml version="1.0" encoding="utf-8"?>')
+    return reparsed
+
+
+def find_subfolders_with_json(root):
+    trainval, test = [], []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if not any(f.endswith('.json') for f in filenames):
+            continue
+        dirname = os.path.basename(dirpath).lower()
+        if 'test' in dirname:
+            test.append(dirpath)
+        elif 'trainval' in dirname or 'train' in dirname:
+            trainval.append(dirpath)
+        else:
+            trainval.append(dirpath)
+    return sorted(trainval), sorted(test)
+
+
+def main():
+    print("=" * 60)
+    print("LabelMe JSON > Pascal VOC XML > COCO")
+    print("=" * 60)
+    print(f"DATASETS_DIR: {DATASETS_DIR}")
+    print(f"WORK_DIR: {WORK_DIR}")
+
+    make_empty_folder(PATH_TO)
+    make_empty_folder(PATH_TO_ANNO)
+    make_empty_folder(PATH_TO_ISET)
+    make_empty_folder(PATH_TO_IMGS)
+
+    paths_trainval, paths_test = find_subfolders_with_json(DATASETS_DIR)
+    print(f"Trainval folders: {len(paths_trainval)}")
+    print(f"Test folders: {len(paths_test)}")
+
+    if not paths_trainval and not paths_test:
+        print("ERROR: No LabelMe JSON found in datasets/")
+        sys.exit(1)
+
+    obj_candidates = [os.path.join(DATASETS_DIR, OBJ_NAMES_FILE)]
+    if paths_trainval:
+        obj_candidates.append(os.path.join(paths_trainval[0], OBJ_NAMES_FILE))
+    if paths_test:
+        obj_candidates.append(os.path.join(paths_test[0], OBJ_NAMES_FILE))
+    obj_names_path = next((p for p in obj_candidates if os.path.exists(p)), None)
+    if obj_names_path is None:
+        print(f"ERROR: {OBJ_NAMES_FILE} not found")
+        sys.exit(1)
+
+    with open(obj_names_path, 'r') as f:
+        LABEL_LIST = [line.strip() for line in f if line.strip()]
+    print(f"Classes ({len(LABEL_LIST)}): {LABEL_LIST}")
+
+    shutil.copy2(obj_names_path, os.path.join(PATH_TO, OBJ_NAMES_FILE))
+
+    JSON_LIST_TRAINVAL = []
+    for p in paths_trainval:
+        JSON_LIST_TRAINVAL.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+    JSON_LIST_TEST = []
+    for p in paths_test:
+        JSON_LIST_TEST.extend(sorted(glob.glob(os.path.join(p, '*.json'))))
+
+    print(f"JSON trainval: {len(JSON_LIST_TRAINVAL)}")
+    print(f"JSON test: {len(JSON_LIST_TEST)}")
+
+    JSON_LIST = JSON_LIST_TRAINVAL + JSON_LIST_TEST
+    for i, fname in enumerate(JSON_LIST):
+        if i % 500 == 0:
+            print(f"  [{i}/{len(JSON_LIST)}]")
+        base = get_filename_without_extension(fname)
+        src_dir = os.path.dirname(fname)
+
+        jpeg_in = os.path.join(src_dir, base + '.jpg')
+        jpeg_out = os.path.join(PATH_TO_IMGS, base + '.jpg')
+        if os.path.exists(jpeg_in):
+            shutil.copy2(jpeg_in, jpeg_out)
+
+        xml_out = os.path.join(PATH_TO_ANNO, base + '.xml')
+
+        img = cv2.imread(jpeg_out)
+        if img is None:
+            continue
+        h, w = img.shape[:2]
+
+        with open(fname, 'r', encoding='utf-8') as f:
+            json_data = json.load(f)
+
+        xml_root = ET.Element('annotation')
+        ET.SubElement(xml_root, 'folder').text = DATA_MAIN_FOLDER
+        ET.SubElement(xml_root, 'filename').text = base + '.jpg'
+        xml_source = ET.SubElement(xml_root, 'source')
+        ET.SubElement(xml_source, 'database').text = DATABASE_NAME
+        ET.SubElement(xml_source, 'annotation').text = ANNOTATION_NAME
+        ET.SubElement(xml_source, 'image').text = IMAGE_NAME
+        ET.SubElement(xml_source, 'flickrid').text = FLICKRID_NAME
+        xml_owner = ET.SubElement(xml_root, 'owner')
+        ET.SubElement(xml_owner, 'flickrid').text = 'Unspecified'
+        ET.SubElement(xml_owner, 'name').text = 'Unspecified'
+        xml_size = ET.SubElement(xml_root, 'size')
+        ET.SubElement(xml_size, 'height').text = str(h)
+        ET.SubElement(xml_size, 'width').text = str(w)
+        ET.SubElement(xml_size, 'depth').text = str(img.shape[2] if len(img.shape) == 3 else 1)
+        ET.SubElement(xml_root, 'segmented').text = '0'
+
+        for shape in json_data.get('shapes', []):
+            shape_label = shape['label']
+            if shape_label not in LABEL_LIST:
+                continue
+            points = np.array(shape['points']).astype(int)
+            x_min, y_min = np.min(points, axis=0)
+            x_max, y_max = np.max(points, axis=0)
+            x_min, y_min, x_max, y_max = correct_box_coords([x_min, y_min, x_max, y_max], h, w)
+
+            xml_obj = ET.SubElement(xml_root, 'object')
+            ET.SubElement(xml_obj, 'difficult').text = '0'
+            ET.SubElement(xml_obj, 'truncated').text = '0'
+            ET.SubElement(xml_obj, 'name').text = shape_label
+            xml_bnd = ET.SubElement(xml_obj, 'bndbox')
+            ET.SubElement(xml_bnd, 'xmin').text = str(x_min)
+            ET.SubElement(xml_bnd, 'ymin').text = str(y_min)
+            ET.SubElement(xml_bnd, 'xmax').text = str(x_max)
+            ET.SubElement(xml_bnd, 'ymax').text = str(y_max)
+
+        with open(xml_out, 'wb') as f:
+            f.write(pretty_print_xml(xml_root).encode('utf-8'))
+
+    XML_LIST_TRAINVAL = [get_filename_without_extension(f) for f in JSON_LIST_TRAINVAL]
+    XML_LIST_TEST = [get_filename_without_extension(f) for f in JSON_LIST_TEST]
+
+    print("=" * 60)
+    print(f"Total Train+Val+Test samples: {len(XML_LIST_TRAINVAL) + len(XML_LIST_TEST)}")
+
+    if len(XML_LIST_TRAINVAL) > 1:
+        ids_train_split, ids_val_split = train_test_split(
+            XML_LIST_TRAINVAL, test_size=SPLIT_SIZE, random_state=RANDOM_STATE
+        )
+    else:
+        ids_train_split, ids_val_split = XML_LIST_TRAINVAL, []
+
+    ids_test = XML_LIST_TEST
+    print(f"Train on {len(ids_train_split)} samples")
+    print(f"Val   on {len(ids_val_split)} samples")
+    print(f"Test  on {len(ids_test)} samples")
+
+    with open(os.path.join(PATH_TO_ISET, 'trainval.txt'), 'w') as f:
+        for name in ids_train_split + ids_val_split:
+            f.write(name + '\n')
+    with open(os.path.join(PATH_TO_ISET, 'train.txt'), 'w') as f:
+        for name in ids_train_split:
+            f.write(name + '\n')
+    with open(os.path.join(PATH_TO_ISET, 'val.txt'), 'w') as f:
+        for name in ids_val_split:
+            f.write(name + '\n')
+    with open(os.path.join(PATH_TO_ISET, 'test.txt'), 'w') as f:
+        for name in ids_test:
+            f.write(name + '\n')
+
+    print("=" * 60)
+    print("VOC dataset ready at:", PATH_TO)
+
+
+if __name__ == '__main__':
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 0b/6: VOC > COCO
+# =============================================================================
+COPY <<'SHELL' /workspace/00b_voc_to_coco.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/00b_voc_to_coco.log}
+{
+echo "=== VOC > COCO conversion ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmdetection
+python tools/dataset_converters/pascal_voc.py \
+    data/${DATA_MAIN_FOLDER:-nlmk_dp_data} \
+    --out-dir data/VOC2007 \
+    --xml-dir Annotations \
+    --img-dir JPEGImages
+echo "VOC > COCO complete."
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/00b_voc_to_coco.sh
+
+# =============================================================================
+# СТАДИЯ 1/6: ТРЕНИРОВКА
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== MMDetection Training ==="
+echo "Timestamp: $(date)"
+echo "PyTorch: $(python -c 'import torch; print(torch.__version__, torch.version.cuda)')"
+echo "MMDetection: $(python -c 'import mmdet; print(mmdet.__version__)')"
+echo "Config: ${GENERATED_CONFIG:-${CONFIG}}"
+echo "---"
+
+cd /workspace/mmdetection
+CONFIG_TO_USE=${GENERATED_CONFIG:-${CONFIG}}
+if [ "${GPUS:-1}" -gt 1 ]; then
+    bash tools/dist_train.sh ${CONFIG_TO_USE} ${GPUS} --seed 0 --work-dir /workspace/work_dirs/${RUN_NAME}
+else
+    python tools/train.py ${CONFIG_TO_USE} --gpu-id 0 --seed 0 --work-dir /workspace/work_dirs/${RUN_NAME}
+fi
+echo "Training complete."
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+# =============================================================================
+# СТАДИЯ 2/6: ТЕСТ .pth
+# =============================================================================
+COPY <<'SHELL' /workspace/02_test_pth.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test_pth.log}
+{
+echo "=== MMDetection Test (PTH) ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmdetection
+CONFIG_TO_USE=${GENERATED_CONFIG:-${CONFIG}}
+python tools/test.py ${CONFIG_TO_USE} ${TRAINED_WEIGHTS} --eval mAP --gpu-id 0
+echo "PTH test complete."
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test_pth.sh
+
+# =============================================================================
+# СТАДИЯ 3/6: ЭКСПОРТ В ONNX
+# =============================================================================
+COPY <<'SHELL' /workspace/03_export_onnx.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/03_export.log}
+{
+echo "=== MMDetection ONNX Export ==="
+echo "Timestamp: $(date)"
+cd /workspace/mmdetection
+CONFIG_TO_USE=${GENERATED_CONFIG:-${CONFIG}}
+mkdir -p $(dirname ${ONNX_PATH})
+
+if python tools/deployment/pytorch2onnx.py \
+    ${CONFIG_TO_USE} \
+    ${TRAINED_WEIGHTS} \
+    --output-file ${ONNX_PATH} \
+    --input-img demo/demo.jpg \
+    --shape 640 640 \
+    --dynamic-export \
+    --verify; then
+    echo "Exported via pytorch2onnx.py"
+else
+    echo "Fallback to mmdeploy..."
+    cd /workspace/mmdeploy
+    python tools/deploy.py \
+        configs/mmdet/detection/detection_onnxruntime_dynamic.py \
+        /workspace/mmdetection/${CONFIG_TO_USE} \
+        /workspace/mmdetection/${TRAINED_WEIGHTS} \
+        /workspace/mmdetection/demo/demo.jpg \
+        --work-dir /workspace/runs/onnx_export \
+        --device cuda \
+        --dump-info
+    cp /workspace/runs/onnx_export/end2end.onnx ${ONNX_PATH} || true
+fi
+echo "ONNX export complete."
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/03_export_onnx.sh
+
+# =============================================================================
+# СТАДИЯ 4/6: ТЕСТ .onnx
+# =============================================================================
+COPY <<'PYTHON' /workspace/04_test_onnx.py
+import argparse, os, time, pickle
+import cv2
+import numpy as np
+import onnxruntime as ort
+from pathlib import Path
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+
+def preprocess(img, imgsz=640):
+    img = cv2.resize(img, (imgsz, imgsz))
+    img = img[:, :, ::-1].transpose(2, 0, 1).astype(np.float32)
+    return np.expand_dims(img, axis=0)
+
+
+def postprocess(outputs, conf_thres=0.25, iou_thres=0.45):
+    if isinstance(outputs, list):
+        preds = np.concatenate([o[0] for o in outputs], axis=0)
+    else:
+        preds = outputs[0]
+    boxes = preds[:, :4]
+    obj_conf = preds[:, 4]
+    cls_scores = preds[:, 5:]
+    cls_ids = np.argmax(cls_scores, axis=1)
+    confidences = obj_conf * cls_scores[np.arange(len(preds)), cls_ids]
+    mask = confidences > conf_thres
+    boxes, cls_ids, confidences = boxes[mask], cls_ids[mask], confidences[mask]
+    if len(boxes) == 0:
+        return []
+    indices = cv2.dnn.NMSBoxes(boxes.tolist(), confidences.tolist(), conf_thres, iou_thres)
+    if len(indices) == 0:
+        return []
+    indices = indices.flatten()
+    return [{"bbox": boxes[i].tolist(), "class_id": int(cls_ids[i]), "score": float(confidences[i])}
+            for i in indices]
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--onnx", default=os.environ.get("ONNX_PATH"))
+    p.add_argument("--dataset", default=os.environ.get("TEST_ANNOTATIONS"))
+    p.add_argument("--images", default=os.environ.get("TEST_IMAGES"))
+    p.add_argument("--log", default="/workspace/logs/04_test_onnx.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== MMDetection Test (ONNX) ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"ONNX: {args.onnx}\n---\n")
+
+    session = ort.InferenceSession(args.onnx, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    coco = COCO(args.dataset)
+    results, latencies = [], []
+    for img_id in coco.getImgIds():
+        info = coco.loadImgs(img_id)[0]
+        img = cv2.imread(str(Path(args.images) / info["file_name"]))
+        if img is None:
+            continue
+        inp = preprocess(img)
+        t0 = time.perf_counter()
+        outputs = session.run(None, {input_name: inp})
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+        for det in postprocess(outputs):
+            x1, y1, x2, y2 = det["bbox"]
+            results.append({
+                "image_id": img_id,
+                "category_id": det["class_id"] + 1,
+                "bbox": [x1, y1, x2 - x1, y2 - y1],
+                "score": det["score"]
+            })
+
+    if not results:
+        with open(args.log, "a") as f:
+            f.write("WARN: no detections, mAP will be 0\n")
+        return
+
+    coco_dt = coco.loadRes(results)
+    ev = COCOeval(coco, coco_dt, "bbox")
+    ev.evaluate(); ev.accumulate(); ev.summarize()
+
+    with open(args.log, "a") as f:
+        f.write(f"mAP@0.5: {ev.stats[1]:.4f}\n")
+        f.write(f"mAP@0.5:0.95: {ev.stats[0]:.4f}\n")
+        f.write(f"Avg latency: {sum(latencies)/len(latencies):.2f} ms\n")
+        f.write("ONNX test complete.\n")
+
+    class_names = [c["name"] for c in coco.loadCats(coco.getCatIds())]
+    with open("/workspace/logs/plots/coco_eval.pkl", "wb") as f:
+        pickle.dump({"coco_eval": ev, "class_names": class_names, "results": results}, f)
+
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 5/6: ГРАФИКИ
+# =============================================================================
+COPY <<'PYTHON' /workspace/05_plots.py
+import os, re, pickle
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+PLOTS_DIR = "/workspace/logs/plots"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+
+def plot_training_curves(log_path):
+    if not Path(log_path).exists():
+        print(f"[SKIP] {log_path} not found")
+        return
+    epochs, losses, maps = [], [], []
+    with open(log_path) as f:
+        for line in f:
+            m_loss = re.search(r"Epoch\s*\[(\d+)\].*loss:\s*([\d.]+)", line)
+            if m_loss:
+                epochs.append(int(m_loss.group(1)))
+                losses.append(float(m_loss.group(2)))
+            m_map = re.search(r"mAP:\s*([\d.]+)", line)
+            if m_map:
+                maps.append(float(m_map.group(1)))
+    if not epochs:
+        print("[SKIP] No loss data parsed")
+        return
+    fig, ax1 = plt.subplots(figsize=(10, 6))
+    ax1.plot(epochs, losses, color="#E74C3C", linewidth=1.5, label="Loss")
+    ax1.set_xlabel("Epoch"); ax1.set_ylabel("Training Loss", color="#E74C3C")
+    ax1.tick_params(axis="y", labelcolor="#E74C3C")
+    if maps:
+        ax2 = ax1.twinx()
+        ax2.plot(range(1, len(maps) + 1), maps, color="#2ECC71", linewidth=1.5, label="mAP")
+        ax2.set_ylabel("Validation mAP", color="#2ECC71")
+        ax2.tick_params(axis="y", labelcolor="#2ECC71")
+    ax1.set_title("MMDetection Training Curves")
+    ax1.grid(alpha=0.3)
+    out = f"{PLOTS_DIR}/01_training_curves.png"
+    plt.savefig(out, dpi=150); plt.close()
+    print(f"[OK] {out}")
+
+
+def plot_pr_curves(coco_eval, class_names=None):
+    precision = coco_eval.eval["precision"]
+    recall = coco_eval.eval["recall"]
+    p = precision[:, :, 0, -1]; r = recall[:, 0, -1]
+    K = p.shape[1]
+    if class_names is None:
+        class_names = [f"class_{i}" for i in range(K)]
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for k in range(K):
+        if r[k] > 0 or p[k].max() > 0:
+            auc = np.trapz(p[k], r[k])
+            ax.plot(r[k], p[k], label=f"{class_names[k]} (AP={auc:.3f})", linewidth=1.5)
+    ax.set_xlabel("Recall"); ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curves (IoU=0.5) — AUC-PR = AP")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
+    ax.legend(loc="lower left", fontsize=8); ax.grid(alpha=0.3)
+    out = f"{PLOTS_DIR}/02_pr_curves.png"
+    plt.savefig(out, dpi=150); plt.close()
+    print(f"[OK] {out}")
+
+
+def plot_confusion_matrix(coco, results, class_names):
+    try:
+        import supervision as sv
+        preds = sv.Detections.from_coco_annotations(results)
+        gt_list = []
+        for img_id in coco.getImgIds():
+            for ann in coco.loadAnns(coco.getAnnIds(imgIds=img_id)):
+                gt_list.append({"image_id": img_id,
+                                "category_id": ann["category_id"],
+                                "bbox": ann["bbox"]})
+        targets = sv.Detections.from_coco_annotations(gt_list)
+        cm = sv.ConfusionMatrix.from_detections(
+            predictions=preds, targets=targets, classes=class_names)
+        cm.plot()
+        out = f"{PLOTS_DIR}/03_confusion_matrix.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight"); plt.close()
+        print(f"[OK] {out}")
+    except Exception as e:
+        print(f"[SKIP] Confusion matrix: {e}")
+
+
+def plot_confidence_profile(results, coco, class_names):
+    if not results:
+        return
+    scores = np.array([r["score"] for r in results])
+    thresholds = np.linspace(0.01, 0.99, 50)
+    precisions, recalls, f1s = [], [], []
+    n_gt = sum(len(coco.getAnnIds(imgIds=i)) for i in coco.getImgIds())
+    for t in thresholds:
+        mask = scores >= t
+        tp = mask.sum(); fp = (~mask).sum(); fn = max(0, n_gt - tp)
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        precisions.append(p); recalls.append(r); f1s.append(f1)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(thresholds, precisions, label="Precision", color="#3498DB")
+    ax.plot(thresholds, recalls, label="Recall", color="#2ECC71")
+    ax.plot(thresholds, f1s, label="F1", color="#E74C3C")
+    best_t = thresholds[np.argmax(f1s)]
+    ax.axvline(best_t, linestyle="--", color="gray", alpha=0.7,
+               label=f"F1-optimal: {best_t:.2f}")
+    ax.set_xlabel("Confidence Threshold"); ax.set_ylabel("Metric Value")
+    ax.set_title("Confidence Profile")
+    ax.legend(); ax.grid(alpha=0.3)
+    out = f"{PLOTS_DIR}/04_confidence_profile.png"
+    plt.savefig(out, dpi=150); plt.close()
+    print(f"[OK] {out}")
+
+
+if __name__ == "__main__":
+    mode = os.environ.get("PLOT_MODE", "test")
+    if mode == "train":
+        plot_training_curves(os.environ.get("TRAIN_LOG", "/workspace/logs/01_train.log"))
+    else:
+        pkl = Path(f"{PLOTS_DIR}/coco_eval.pkl")
+        if pkl.exists():
+            with open(pkl, "rb") as f:
+                data = pickle.load(f)
+            plot_pr_curves(data["coco_eval"], data.get("class_names"))
+            from pycocotools.coco import COCO
+            coco = COCO(os.environ["TEST_ANNOTATIONS"])
+            plot_confusion_matrix(coco, data["results"], data.get("class_names"))
+            plot_confidence_profile(data["results"], coco, data.get("class_names"))
+PYTHON
+
+# =============================================================================
+# ГЛАВНЫЙ PIPELINE (entrypoint)
+# =============================================================================
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots /workspace/configs_generated
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG
+}
+
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "=========================================="
+log "MMDetection Modular Pipeline START"
+log "=========================================="
+
+RUN_NAME=${RUN_NAME:-mmdet_run}
+TRAINED_WEIGHTS=${TRAINED_WEIGHTS:-/workspace/work_dirs/${RUN_NAME}/best_mAP_epoch_*.pth}
+ONNX_PATH=${ONNX_PATH:-/workspace/runs/onnx/model.onnx}
+TEST_ANNOTATIONS=${TEST_ANNOTATIONS:-/workspace/mmdetection/data/VOC2007/annotations/test.json}
+TEST_IMAGES=${TEST_IMAGES:-/workspace/mmdetection/data/VOC2007/test}
+
+# -----------------------------------------------------------------------------
+# ШАГ 0: Генерация конфига (или использование готового CONFIG)
+# -----------------------------------------------------------------------------
+CURRENT_STEP="0/6 CONFIG"
+log "STEP 0/6: Preparing config..."
+if [ -n "${CONFIG}" ]; then
+    log "  CONFIG is set, using existing: ${CONFIG}"
+    export GENERATED_CONFIG="${CONFIG}"
+else
+    log "  CONFIG not set, generating from BACKBONE + NECK + HEAD..."
+    GENERATED=$(python /workspace/generate_config.py)
+    export GENERATED_CONFIG="${GENERATED}"
+    log "  Generated: ${GENERATED_CONFIG}"
+fi
+log "  BACKBONE=${BACKBONE:-CSPDarknet} NECK=${NECK:-YOLOXPAFPN} HEAD=${HEAD:-YOLOXHead}"
+log ""
+
+export RUN_NAME TRAINED_WEIGHTS ONNX_PATH TEST_ANNOTATIONS TEST_IMAGES
+export DATA_ROOT=${DATA_ROOT:-/workspace/mmdetection/data/VOC2007}
+
+# -----------------------------------------------------------------------------
+# ШАГ 1/6: КОНВЕРТАЦИЯ ДАТАСЕТА
+# -----------------------------------------------------------------------------
+CURRENT_STEP="1/6 CONVERT"
+log "STEP 1/6: Converting LabelMe > VOC > COCO"
+START=$(date +%s)
+python /workspace/00_convert.py 2>&1 | tee -a /workspace/logs/00_convert.log
+bash /workspace/00b_voc_to_coco.sh
+END=$(date +%s)
+log "STEP 1/6: Conversion finished in $((END-START))s"
+log ""
+
+# -----------------------------------------------------------------------------
+# ШАГ 2/6: ТРЕНИРОВКА
+# -----------------------------------------------------------------------------
+CURRENT_STEP="2/6 TRAIN"
+log "STEP 2/6: Training started > logs/01_train.log"
+START=$(date +%s)
+bash /workspace/01_train.sh
+END=$(date +%s)
+log "STEP 2/6: Training finished in $((END-START))s"
+log "  > Generating training curves..."
+PLOT_MODE=train python /workspace/05_plots.py 2>&1 | tee -a $MASTER_LOG
+log ""
+
+# -----------------------------------------------------------------------------
+# ШАГ 3/6: ТЕСТ .pth
+# -----------------------------------------------------------------------------
+CURRENT_STEP="3/6 TEST PTH"
+log "STEP 3/6: Testing .pth"
+START=$(date +%s)
+bash /workspace/02_test_pth.sh
+END=$(date +%s)
+log "STEP 3/6: Testing .pth finished in $((END-START))s"
+log ""
+
+# -----------------------------------------------------------------------------
+# ШАГ 4/6: ЭКСПОРТ В ONNX
+# -----------------------------------------------------------------------------
+CURRENT_STEP="4/6 EXPORT ONNX"
+log "STEP 4/6: Exporting to ONNX"
+START=$(date +%s)
+bash /workspace/03_export_onnx.sh
+END=$(date +%s)
+log "STEP 4/6: Export finished in $((END-START))s"
+
+if [ ! -f "${ONNX_PATH}" ]; then
+    log "ERROR: ONNX file not found at ${ONNX_PATH}"
+    exit 1
+fi
+log "  ? ONNX created: ${ONNX_PATH}"
+log ""
+
+# -----------------------------------------------------------------------------
+# ШАГ 5/6: ТЕСТ .onnx
+# -----------------------------------------------------------------------------
+CURRENT_STEP="5/6 TEST ONNX"
+log "STEP 5/6: Testing .onnx"
+START=$(date +%s)
+python /workspace/04_test_onnx.py
+END=$(date +%s)
+log "STEP 5/6: Testing .onnx finished in $((END-START))s"
+log ""
+
+# -----------------------------------------------------------------------------
+# ШАГ 6/6: ГРАФИКИ
+# -----------------------------------------------------------------------------
+CURRENT_STEP="6/6 PLOTS"
+log "STEP 6/6: Generating PR curves + confusion matrix + confidence profile..."
+START=$(date +%s)
+python /workspace/05_plots.py 2>&1 | tee -a $MASTER_LOG
+END=$(date +%s)
+log "STEP 6/6: Plots finished in $((END-START))s"
+log "  > Plots: /workspace/logs/plots/"
+log ""
+
+log "=========================================="
+log "Pipeline COMPLETE"
+log "BACKBONE = ${BACKBONE:-CSPDarknet}"
+log "NECK     = ${NECK:-YOLOXPAFPN}"
+log "HEAD     = ${HEAD:-YOLOXHead}"
+log "Final ONNX: ${ONNX_PATH}"
+log "Logs: /workspace/logs/"
+log "Plots: /workspace/logs/plots/"
+log "=========================================="
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]

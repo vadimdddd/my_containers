@@ -1,0 +1,192 @@
+# =============================================================================
+# tensorrt_docker.dockerfile
+# TensorRT 10.x (NVIDIA, бесплатная) — оптимизация ONNX-инференса.
+#
+# ЧТО ЭТО:
+#   TensorRT — компилятор NVIDIA для максимально быстрого инференса ONNX.
+#   Даёт 2-5x ускорение относительно ONNX Runtime.
+#
+# ВАЖНО ПРО ЛИЦЕНЗИЮ:
+#   Проприетарная NVIDIA. SDK лицензирован для разработки приложений
+#   только для систем с NVIDIA GPU.
+#   Бесплатен для использования.
+#
+# СОВМЕСТИМОСТЬ:
+#   Версия TensorRT на машине сборки engine должна совпадать
+#   с версией на машине инференса. Иначе engine не загрузится.
+#
+# БАЗОВЫЙ ОБРАЗ: NGC TensorRT container
+#   25.06 (CUDA 12.9, TRT 10.11)
+#   25.08 (CUDA 13.0, TRT 10.13)
+# =============================================================================
+
+FROM nvcr.io/nvidia/tensorrt:25.06-py3
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# PyTorch для загрузки ONNX
+RUN pip install --no-cache-dir \
+    torch==2.6.0 torchvision==0.21.0 \
+    --index-url https://download.pytorch.org/whl/cu126
+
+# TensorRT Python API + Polygraphy для отладки
+RUN pip install --no-cache-dir \
+    tensorrt \
+    polygraphy \
+    onnx onnxruntime \
+    pycuda \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy
+
+RUN mkdir -p /workspace/onnx /workspace/runs /workspace/logs
+
+# =============================================================================
+# ONNX > TensorRT ENGINE
+# =============================================================================
+COPY <<'PYTHON' /workspace/build_engine.py
+"""
+Конвертация ONNX > TensorRT engine.
+
+РЕЖИМЫ:
+  FP32: максимальная точность
+  FP16: баланс (рекомендуется)
+  INT8: максимальная скорость (нужен calibration dataset)
+"""
+import os, time, argparse
+import tensorrt as trt
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--onnx", required=True)
+    p.add_argument("--engine", default="/workspace/runs/model.engine")
+    p.add_argument("--precision", default="fp16", choices=["fp32", "fp16", "int8"])
+    p.add_argument("--workspace", type=int, default=4096)
+    p.add_argument("--log", default="/workspace/logs/tensorrt.log")
+    args = p.parse_args()
+
+    os.makedirs(os.path.dirname(args.engine), exist_ok=True)
+
+    with open(args.log, "a") as f:
+        f.write(f"=== TensorRT Engine Build ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"ONNX: {args.onnx}, Precision: {args.precision}\n")
+
+    logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(logger)
+    network = builder.create_network(
+        1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    parser = trt.OnnxParser(network, logger)
+
+    with open(args.onnx, 'rb') as f:
+        if not parser.parse(f.read()):
+            for i in range(parser.num_errors):
+                print(parser.get_error(i))
+            raise RuntimeError("ONNX parse failed")
+
+    config = builder.create_builder_config()
+    config.set_memory_pool_limit(
+        trt.MemoryPoolType.WORKSPACE, args.workspace * (1 << 20))
+
+    if args.precision == "fp16" and builder.platform_has_fast_fp16:
+        config.set_flag(trt.BuilderFlag.FP16)
+    elif args.precision == "int8" and builder.platform_has_fast_int8:
+        config.set_flag(trt.BuilderFlag.INT8)
+
+    t0 = time.perf_counter()
+    serialized_engine = builder.build_serialized_network(network, config)
+    build_time = time.perf_counter() - t0
+
+    with open(args.engine, 'wb') as f:
+        f.write(serialized_engine)
+
+    with open(args.log, "a") as f:
+        f.write(f"Engine: {args.engine}, build time: {build_time:.2f}s\n")
+
+    print(f"Engine built: {args.engine} ({build_time:.2f}s)")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# BENCHMARK: TensorRT vs ONNX Runtime
+# =============================================================================
+COPY <<'PYTHON' /workspace/benchmark.py
+"""
+Сравнение latency: ONNX Runtime vs TensorRT.
+"""
+import os, time, argparse
+import numpy as np
+import tensorrt as trt
+import onnxruntime as ort
+import pycuda.driver as cuda
+import pycuda.autoinit
+
+def benchmark_trt(engine_path, input_shape, n_runs=100):
+    logger = trt.Logger(trt.Logger.ERROR)
+    with open(engine_path, 'rb') as f:
+        runtime = trt.Runtime(logger)
+        engine = runtime.deserialize_cuda_engine(f.read())
+    context = engine.create_execution_context()
+
+    bindings = []
+    for binding in engine:
+        shape = engine.get_binding_shape(binding)
+        size = trt.volume(shape)
+        dtype = trt.nptype(engine.get_binding_dtype(binding))
+        host_mem = cuda.pagelocked_empty(size, dtype)
+        device_mem = cuda.mem_alloc(host_mem.nbytes)
+        bindings.append(int(device_mem))
+
+    stream = cuda.Stream()
+    latencies = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        context.execute_async_v2(bindings=bindings, stream_handle=stream.handle)
+        stream.synchronize()
+        latencies.append((time.perf_counter() - t0) * 1000)
+    return np.mean(latencies), np.percentile(latencies, 95)
+
+def benchmark_onnx(onnx_path, input_shape, n_runs=100):
+    session = ort.InferenceSession(
+        onnx_path, providers=["CUDAExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+    dummy = np.random.randn(*input_shape).astype(np.float32)
+    latencies = []
+    for _ in range(n_runs):
+        t0 = time.perf_counter()
+        session.run(None, {input_name: dummy})
+        latencies.append((time.perf_counter() - t0) * 1000)
+    return np.mean(latencies), np.percentile(latencies, 95)
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--engine", required=True)
+    p.add_argument("--onnx", required=True)
+    p.add_argument("--shape", default="1,3,640,640")
+    p.add_argument("--log", default="/workspace/logs/benchmark.log")
+    args = p.parse_args()
+
+    shape = tuple(map(int, args.shape.split(",")))
+    trt_mean, trt_p95 = benchmark_trt(args.engine, shape)
+    ort_mean, ort_p95 = benchmark_onnx(args.onnx, shape)
+    speedup = ort_mean / trt_mean
+
+    with open(args.log, "a") as f:
+        f.write(f"=== Benchmark ===\n")
+        f.write(f"TensorRT: {trt_mean:.2f}ms (p95={trt_p95:.2f}ms)\n")
+        f.write(f"ONNX RT:  {ort_mean:.2f}ms (p95={ort_p95:.2f}ms)\n")
+        f.write(f"Speedup: {speedup:.2f}x\n")
+
+    print(f"TensorRT: {trt_mean:.2f}ms | "
+          f"ONNX RT: {ort_mean:.2f}ms | Speedup: {speedup:.2f}x")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

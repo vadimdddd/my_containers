@@ -1,0 +1,141 @@
+# =============================================================================
+# rtmpose_docker.dockerfile
+# RTMPose (Apache 2.0) — real-time multi-person pose estimation.
+#
+# АРХИТЕКТУРА:
+#   RTMPose использует CSPNeXt backbone + SimCC head.
+#   Поддерживает ONNX Runtime и TensorRT для максимальной скорости [citation:3][citation:33]
+#
+# РЕЗУЛЬТАТЫ:
+#   RTMPose-t: 65.9 AP (Body8, 256x192) [citation:18]
+#   RTMPose-m: 74.9 AP (Body8, 256x192) [citation:18]
+#   RTMPose-l: 76.7 AP (Body8, 256x192) [citation:18]
+#
+# ПРЕДОБУЧЕННЫЕ МОДЕЛИ:
+#   Все модели доступны как .pth и ONNX SDK [citation:13][citation:33]
+# =============================================================================
+
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    gcc g++ ninja-build ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+RUN pip install --no-cache-dir \
+    mmcv-full==1.7.0 \
+    -f https://download.openmmlab.com/mmcv/dist/cu113/torch1.10.0/index.html
+
+# MMPose с поддержкой RTMPose
+RUN git clone -b 'v0.29.0' https://github.com/open-mmlab/mmpose.git . \
+    && pip install --no-cache-dir -r requirements.txt \
+    && pip install --no-cache-dir -v -e .
+
+RUN pip install --no-cache-dir xtcocotools
+
+# rtmlib для лёгкого инференса RTMPose через ONNX [citation:26][citation:33]
+RUN pip install --no-cache-dir rtmlib
+
+RUN pip install --no-cache-dir \
+    onnx onnxruntime onnxsim \
+    opencv-python-headless \
+    matplotlib seaborn pandas scipy \
+    tqdm
+
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots \
+    /workspace/mmpose/data /workspace/work_dirs
+
+# =============================================================================
+# КОНВЕРТАЦИЯ — та же, что у MMPose (COCO Keypoints)
+# =============================================================================
+COPY <<'PYTHON' /workspace/00_convert.py
+# ... (идентично mmpose_docker.dockerfile)
+PYTHON
+
+# =============================================================================
+# ТРЕНИРОВКА RTMPose
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== RTMPose Training ==="
+echo "Config: ${CONFIG:-configs/body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py}"
+cd /workspace/mmpose
+python tools/train.py ${CONFIG} --work-dir /workspace/work_dirs/${RUN_NAME:-rtmpose}
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+# =============================================================================
+# ИНФЕРЕНС через rtmlib (ONNX Runtime)
+# =============================================================================
+COPY <<'PYTHON' /workspace/inference.py
+"""
+RTMPose inference через rtmlib (ONNX Runtime).
+"""
+import os, time, argparse
+import cv2
+from rtmlib import Body, draw_skeleton
+import numpy as np
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--video", default="/workspace/videos/input.mp4")
+    p.add_argument("--output", default="/workspace/runs/pose_tracked.mp4")
+    p.add_argument("--mode", default="balanced", choices=["lightweight", "balanced", "performance"])
+    p.add_argument("--log", default="/workspace/logs/inference.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== RTMPose Inference ===\nTimestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"Mode: {args.mode}\n")
+
+    body = Body(mode=args.mode, backend="onnxruntime", device="cuda")
+
+    cap = cv2.VideoCapture(args.video)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    writer = cv2.VideoWriter(args.output, cv2.VideoWriter_fourcc(*'mp4v'), fps, (w, h))
+
+    frame_idx = 0
+    total_latency = 0.0
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        t0 = time.time()
+        keypoints, scores = body(frame)
+        latency = (time.time() - t0) * 1000
+        total_latency += latency
+
+        img_show = frame.copy()
+        img_show = draw_skeleton(img_show, keypoints, scores, kpt_thr=0.3, line_width=2)
+
+        writer.write(img_show)
+        frame_idx += 1
+
+        if frame_idx % 100 == 0:
+            print(f"Frame {frame_idx}, avg latency: {total_latency/frame_idx:.2f} ms")
+
+    cap.release()
+    writer.release()
+
+    with open(args.log, "a") as f:
+        f.write(f"Total frames: {frame_idx}\n")
+        f.write(f"Avg latency: {total_latency/frame_idx:.2f} ms\n")
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+ENTRYPOINT ["/bin/bash"]

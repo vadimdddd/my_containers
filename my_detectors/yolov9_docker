@@ -1,0 +1,558 @@
+# =============================================================================
+# yolov9_docker.dockerfile
+# YOLOv9 (MIT-лицензия) — полностью автоматический пайплайн:
+#   train > test .pth > export .onnx > test .onnx > plots
+#
+# ЗАЧЕМ ЭТОТ ОБРАЗ:
+#   Один `docker run` выполняет все 5 стадий и на выходе даёт готовую .onnx
+#   модель + 6 логов (мастер-лог + 5 логов по стадиям) + 4 графика.
+#
+# ЛИЦЕНЗИЯ:
+#   MIT-сборка MultimediaTechLab/YOLO (не AGPL Ultralytics).
+#   Веса yolov9-*.pt из релизов WongKinYiu/yolov9 — отдельный артефакт,
+#   не подпадает под AGPL. Можно использовать в закрытых продуктах.
+#
+# СОВМЕСТИМОСТЬ ВЕРСИЙ (критично!):
+#   Код YOLOv9 жёстко завязан на torchvision.ops.nms из 0.11.0 и
+#   torch.cuda.amp.GradScaler из torch 1.10.0. Более новые версии ломают
+#   train_dual.py / val_dual.py. Поэтому PyTorch 1.10.0 + CUDA 11.3.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# БАЗОВЫЙ ОБРАЗ: PyTorch 1.10.0 + CUDA 11.3 + cuDNN 8 (devel)
+#
+# ПОЧЕМУ devel: содержит nvcc и заголовки CUDA — нужны для сборки
+#               C-расширений (pycocotools).
+# ПОЧЕМУ 1.10.0: единственная версия, совместимая с кодом YOLOv9.
+# -----------------------------------------------------------------------------
+FROM pytorch/pytorch:1.10.0-cuda11.3-cudnn8-devel
+
+# -----------------------------------------------------------------------------
+# СИСТЕМНЫЕ ЗАВИСИМОСТИ
+#   git          — для git clone репозитория YOLO
+#   wget         — для скачивания предобученных весов
+#   libgl1       — OpenCV требует libGL.so.1
+#   libglib2.0-0 — OpenCV требует libgthread-2.0.so.0
+#   libsm6, libxext6, libxrender-dev — X11-библиотеки для OpenCV
+# -----------------------------------------------------------------------------
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git wget libgl1 libglib2.0-0 libsm6 libxext6 libxrender-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# -----------------------------------------------------------------------------
+# РАБОЧАЯ ДИРЕКТОРИЯ
+#   /workspace/datasets — датасет (монтируется с хоста)
+#   /workspace/runs     — чекпоинты, ONNX, результаты (монтируется)
+#   /workspace/logs     — логи и графики (монтируется)
+# -----------------------------------------------------------------------------
+WORKDIR /workspace
+
+# -----------------------------------------------------------------------------
+# ФИКСАЦИЯ TORCHVISION
+#   Без torchvision не работают torchvision.ops.nms и box_iou.
+#   0.11.0 — единственная версия, совместимая с torch 1.10.0.
+#   --index-url cu113 — чтобы pip поставил GPU-сборку, а не CPU.
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    torchvision==0.11.0 torchaudio==0.10.0 \
+    --index-url https://download.pytorch.org/whl/cu113
+
+# -----------------------------------------------------------------------------
+# КЛОНИРОВАНИЕ MIT-РЕПОЗИТОРИЯ + ЗАВИСИМОСТИ
+#   MultimediaTechLab/YOLO — MIT-сборка YOLOv9. Содержит train_dual.py,
+#   val_dual.py, export.py, models/ с YAML-конфигами архитектур.
+#   requirements.txt — PyYAML, tqdm, matplotlib, seaborn, pandas, scipy и др.
+# -----------------------------------------------------------------------------
+RUN git clone https://github.com/MultimediaTechLab/YOLO.git . \
+    && pip install --no-cache-dir -r requirements.txt
+
+# -----------------------------------------------------------------------------
+# ДОПОЛНИТЕЛЬНЫЕ ЗАВИСИМОСТИ ДЛЯ ТЕСТА, ЭКСПОРТА И ГРАФИКОВ
+#   onnx, onnxsim — экспорт и упрощение ONNX-графа
+#   onnxruntime   — инференс ONNX
+#   pycocotools   — COCOeval для mAP и PR-кривых
+#   supervision   — confusion matrix, утилиты
+#   opencv-python-headless — OpenCV без GUI
+#   albumentations — аугментации
+#   matplotlib, seaborn, pandas, scipy — графики и парсинг
+# -----------------------------------------------------------------------------
+RUN pip install --no-cache-dir \
+    onnx onnxruntime onnxsim \
+    pycocotools \
+    supervision \
+    opencv-python-headless \
+    albumentations \
+    matplotlib seaborn pandas scipy
+
+# -----------------------------------------------------------------------------
+# СКАЧИВАНИЕ ПРЕДОБУЧЕННЫХ ВЕСОВ COCO
+#   Стартовая точка для файн-тюнинга. || true — не падаем, если GitHub недоступен.
+# -----------------------------------------------------------------------------
+RUN mkdir -p /workspace/weights && \
+    wget -q https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-c.pt \
+    -O /workspace/weights/yolov9-c.pt && \
+    wget -q https://github.com/WongKinYiu/yolov9/releases/download/v0.1/yolov9-m.pt \
+    -O /workspace/weights/yolov9-m.pt || true
+
+# -----------------------------------------------------------------------------
+# ДИРЕКТОРИИ ДЛЯ МОНТИРОВАНИЯ
+# -----------------------------------------------------------------------------
+RUN mkdir -p /workspace/datasets /workspace/runs /workspace/logs /workspace/logs/plots
+
+# =============================================================================
+# СТАДИЯ 1/5: ТРЕНИРОВКА
+# =============================================================================
+COPY <<'SHELL' /workspace/01_train.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/01_train.log}
+{
+echo "=== YOLOv9 Training ==="
+echo "Timestamp: $(date)"
+echo "PyTorch: $(python -c 'import torch; print(torch.__version__, torch.version.cuda)')"
+echo "Dataset config: ${DATASET_CONFIG}"
+echo "Model config: ${MODEL_CFG}"
+echo "Pretrained weights: ${PRETRAINED_WEIGHTS}"
+echo "Epochs: ${EPOCHS}, Batch: ${BATCH}, Device: ${DEVICE}"
+echo "---"
+
+python train_dual.py \
+    --workers ${WORKERS:-4} \
+    --device ${DEVICE:-0} \
+    --batch ${BATCH:-4} \
+    --data ${DATASET_CONFIG} \
+    --img ${IMG_SIZE:-640} \
+    --cfg ${MODEL_CFG:-models/detect/yolov9-c.yaml} \
+    --weights ${PRETRAINED_WEIGHTS:-weights/yolov9-c.pt} \
+    --name ${RUN_NAME:-yolov9-custom} \
+    --hyp ${HYP:-hyp.scratch-high.yaml} \
+    --min-items 0 \
+    --epochs ${EPOCHS:-300} \
+    --close-mosaic ${CLOSE_MOSAIC:-15}
+
+echo "Training complete."
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/01_train.sh
+
+# =============================================================================
+# СТАДИЯ 2/5: ТЕСТ .pth (baseline)
+# =============================================================================
+COPY <<'SHELL' /workspace/02_test_pth.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/02_test_pth.log}
+{
+echo "=== YOLOv9 Test (PTH) ==="
+echo "Timestamp: $(date)"
+echo "Weights: ${TRAINED_WEIGHTS}"
+echo "---"
+
+python val_dual.py \
+    --data ${DATASET_CONFIG} \
+    --img ${IMG_SIZE:-640} \
+    --batch ${BATCH:-4} \
+    --conf ${CONF:-0.001} \
+    --iou ${IOU:-0.5} \
+    --device ${DEVICE:-0} \
+    --weights ${TRAINED_WEIGHTS} \
+    --name ${RUN_NAME:-yolov9-custom}
+
+echo "--- VAL complete, running TEST ---"
+
+python val_dual.py \
+    --data ${DATASET_CONFIG} \
+    --img ${IMG_SIZE:-640} \
+    --task test \
+    --batch ${BATCH:-4} \
+    --conf ${CONF:-0.001} \
+    --iou ${IOU:-0.5} \
+    --device ${DEVICE:-0} \
+    --weights ${TRAINED_WEIGHTS} \
+    --name ${RUN_NAME:-yolov9-custom}
+
+echo "PTH test complete."
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/02_test_pth.sh
+
+# =============================================================================
+# СТАДИЯ 3/5: ЭКСПОРТ В ONNX
+# =============================================================================
+COPY <<'SHELL' /workspace/03_export_onnx.sh
+#!/bin/bash
+set -e
+LOG_FILE=${LOG_FILE:-/workspace/logs/03_export.log}
+{
+echo "=== YOLOv9 ONNX Export ==="
+echo "Timestamp: $(date)"
+echo "Weights: ${TRAINED_WEIGHTS}"
+echo "---"
+
+python export.py \
+    --weights ${TRAINED_WEIGHTS} \
+    --imgsz ${IMG_SIZE:-640} \
+    --include onnx
+
+echo "ONNX export complete."
+} 2>&1 | tee $LOG_FILE
+SHELL
+RUN chmod +x /workspace/03_export_onnx.sh
+
+# =============================================================================
+# СТАДИЯ 4/5: ТЕСТ .onnx (сравнение с .pth)
+# =============================================================================
+COPY <<'PYTHON' /workspace/04_test_onnx.py
+import argparse, os, time, pickle
+import cv2
+import numpy as np
+import onnxruntime as ort
+from pathlib import Path
+from pycocotools.coco import COCO
+from pycocotools.cocoeval import COCOeval
+
+def preprocess(img, imgsz=640):
+    img = cv2.resize(img, (imgsz, imgsz))
+    img = img[:, :, ::-1].transpose(2, 0, 1).astype(np.float32) / 255.0
+    return np.expand_dims(img, axis=0)
+
+def postprocess(outputs, conf_thres=0.25, iou_thres=0.45):
+    preds = outputs[0][0].T
+    boxes, scores = preds[:, :4], preds[:, 4:]
+    class_ids = np.argmax(scores, axis=1)
+    confidences = np.max(scores, axis=1)
+    mask = confidences > conf_thres
+    boxes, class_ids, confidences = boxes[mask], class_ids[mask], confidences[mask]
+    indices = cv2.dnn.NMSBoxes(boxes.tolist(), confidences.tolist(), conf_thres, iou_thres)
+    if len(indices) == 0:
+        return []
+    indices = indices.flatten()
+    return [{"bbox": boxes[i].tolist(), "class_id": int(class_ids[i]), "score": float(confidences[i])}
+            for i in indices]
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--onnx", default=os.environ.get("ONNX_PATH"))
+    p.add_argument("--dataset", default=os.environ.get("TEST_ANNOTATIONS"))
+    p.add_argument("--images", default=os.environ.get("TEST_IMAGES"))
+    p.add_argument("--log", default="/workspace/logs/04_test_onnx.log")
+    args = p.parse_args()
+
+    with open(args.log, "a") as f:
+        f.write(f"=== YOLOv9 Test (ONNX) ===\n")
+        f.write(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        f.write(f"ONNX: {args.onnx}\n---\n")
+
+    session = ort.InferenceSession(args.onnx, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    input_name = session.get_inputs()[0].name
+
+    coco = COCO(args.dataset)
+    results, latencies = [], []
+    for img_id in coco.getImgIds():
+        info = coco.loadImgs(img_id)[0]
+        img = cv2.imread(str(Path(args.images) / info["file_name"]))
+        inp = preprocess(img)
+        t0 = time.perf_counter()
+        outputs = session.run(None, {input_name: inp})
+        t1 = time.perf_counter()
+        latencies.append((t1 - t0) * 1000)
+        for det in postprocess(outputs):
+            x, y, w, h = det["bbox"]
+            results.append({
+                "image_id": img_id,
+                "category_id": det["class_id"] + 1,
+                "bbox": [x - w/2, y - h/2, w, h],
+                "score": det["score"]
+            })
+
+    coco_dt = coco.loadRes(results)
+    ev = COCOeval(coco, coco_dt, "bbox")
+    ev.evaluate(); ev.accumulate(); ev.summarize()
+
+    with open(args.log, "a") as f:
+        f.write(f"mAP@0.5: {ev.stats[1]:.4f}\n")
+        f.write(f"mAP@0.5:0.95: {ev.stats[0]:.4f}\n")
+        f.write(f"Avg latency: {sum(latencies)/len(latencies):.2f} ms\n")
+        f.write("ONNX test complete.\n")
+
+    class_names = [c["name"] for c in coco.loadCats(coco.getCatIds())]
+    with open("/workspace/logs/plots/coco_eval.pkl", "wb") as f:
+        pickle.dump({"coco_eval": ev, "class_names": class_names, "results": results}, f)
+
+if __name__ == "__main__":
+    main()
+PYTHON
+
+# =============================================================================
+# СТАДИЯ 5/5: ГРАФИКИ
+#   1. Training curves (loss, mAP, P, R по эпохам)
+#   2. Precision-Recall curves (AUC-PR = AP)
+#   3. Confusion Matrix
+#   4. Confidence Profile (P/R/F1 vs confidence threshold)
+# =============================================================================
+COPY <<'PYTHON' /workspace/05_plots.py
+import os, csv, pickle
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from pathlib import Path
+
+PLOTS_DIR = "/workspace/logs/plots"
+os.makedirs(PLOTS_DIR, exist_ok=True)
+
+
+def plot_training_curves(results_csv):
+    if not Path(results_csv).exists():
+        print(f"[SKIP] {results_csv} not found")
+        return
+    rows = []
+    with open(results_csv) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append({k.strip(): v for k, v in row.items()})
+    if not rows:
+        return
+    epochs = [int(r.get("epoch", i)) for i, r in enumerate(rows)]
+
+    def get(col):
+        try:
+            return [float(r.get(col, 0)) for r in rows]
+        except (ValueError, TypeError):
+            return None
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle("YOLOv9 Training Curves", fontsize=16, fontweight="bold")
+    plots = [
+        ("train/box_loss", "Train Box Loss", "#E74C3C"),
+        ("train/cls_loss", "Train Cls Loss", "#E67E22"),
+        ("val/box_loss", "Val Box Loss", "#F39C12"),
+        ("metrics/mAP50", "Val mAP@0.5", "#2ECC71"),
+        ("metrics/mAP50-95", "Val mAP@0.5:0.95", "#27AE60"),
+        ("metrics/precision", "Val Precision", "#3498DB"),
+    ]
+    for ax, (col, title, color) in zip(axes.flat, plots):
+        vals = get(col)
+        if vals:
+            ax.plot(epochs, vals, color=color, linewidth=1.5)
+            ax.set_title(title)
+            ax.set_xlabel("Epoch")
+            ax.grid(alpha=0.3)
+        else:
+            ax.text(0.5, 0.5, f"{col}\nnot found", ha="center", va="center")
+            ax.set_title(title)
+    plt.tight_layout()
+    out = f"{PLOTS_DIR}/01_training_curves.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"[OK] {out}")
+
+
+def plot_pr_curves(coco_eval, class_names=None):
+    precision = coco_eval.eval["precision"]
+    recall = coco_eval.eval["recall"]
+    p = precision[:, :, 0, -1]
+    r = recall[:, 0, -1]
+    K = p.shape[1]
+    if class_names is None:
+        class_names = [f"class_{i}" for i in range(K)]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    for k in range(K):
+        if r[k] > 0 or p[k].max() > 0:
+            auc = np.trapz(p[k], r[k])
+            ax.plot(r[k], p[k], label=f"{class_names[k]} (AP={auc:.3f})", linewidth=1.5)
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.set_title("Precision-Recall Curves (IoU=0.5) — AUC-PR = AP")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.05)
+    ax.legend(loc="lower left", fontsize=8)
+    ax.grid(alpha=0.3)
+    out = f"{PLOTS_DIR}/02_pr_curves.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"[OK] {out}")
+
+
+def plot_confusion_matrix(coco, results, class_names):
+    try:
+        import supervision as sv
+        preds = sv.Detections.from_coco_annotations(results)
+        gt_list = []
+        for img_id in coco.getImgIds():
+            ann_ids = coco.getAnnIds(imgIds=img_id)
+            anns = coco.loadAnns(ann_ids)
+            for ann in anns:
+                gt_list.append({
+                    "image_id": img_id,
+                    "category_id": ann["category_id"],
+                    "bbox": ann["bbox"],
+                })
+        targets = sv.Detections.from_coco_annotations(gt_list)
+        cm = sv.ConfusionMatrix.from_detections(
+            predictions=preds, targets=targets, classes=class_names
+        )
+        cm.plot()
+        out = f"{PLOTS_DIR}/03_confusion_matrix.png"
+        plt.savefig(out, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"[OK] {out}")
+    except Exception as e:
+        print(f"[SKIP] Confusion matrix: {e}")
+
+
+def plot_confidence_profile(results, coco, class_names):
+    if not results:
+        return
+    scores = np.array([r["score"] for r in results])
+    thresholds = np.linspace(0.01, 0.99, 50)
+    precisions, recalls, f1s = [], [], []
+    n_gt = sum(len(coco.getAnnIds(imgIds=i)) for i in coco.getImgIds())
+
+    for t in thresholds:
+        mask = scores >= t
+        tp = mask.sum()
+        fp = (~mask).sum()
+        fn = max(0, n_gt - tp)
+        p = tp / (tp + fp) if (tp + fp) > 0 else 0
+        r = tp / (tp + fn) if (tp + fn) > 0 else 0
+        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        precisions.append(p); recalls.append(r); f1s.append(f1)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.plot(thresholds, precisions, label="Precision", color="#3498DB")
+    ax.plot(thresholds, recalls, label="Recall", color="#2ECC71")
+    ax.plot(thresholds, f1s, label="F1", color="#E74C3C")
+    best_t = thresholds[np.argmax(f1s)]
+    ax.axvline(best_t, linestyle="--", color="gray", alpha=0.7,
+               label=f"F1-optimal: {best_t:.2f}")
+    ax.set_xlabel("Confidence Threshold")
+    ax.set_ylabel("Metric Value")
+    ax.set_title("Confidence Profile")
+    ax.legend(); ax.grid(alpha=0.3)
+    out = f"{PLOTS_DIR}/04_confidence_profile.png"
+    plt.savefig(out, dpi=150)
+    plt.close()
+    print(f"[OK] {out}")
+
+
+if __name__ == "__main__":
+    mode = os.environ.get("PLOT_MODE", "test")
+    if mode == "train":
+        results_csv = os.environ.get(
+            "RESULTS_CSV",
+            f"/workspace/runs/train/{os.environ.get('RUN_NAME', 'yolov9-custom')}/results.csv",
+        )
+        plot_training_curves(results_csv)
+    else:
+        pkl = Path(f"{PLOTS_DIR}/coco_eval.pkl")
+        if pkl.exists():
+            with open(pkl, "rb") as f:
+                data = pickle.load(f)
+            plot_pr_curves(data["coco_eval"], data.get("class_names"))
+            from pycocotools.coco import COCO
+            coco = COCO(os.environ["TEST_ANNOTATIONS"])
+            plot_confusion_matrix(coco, data["results"], data.get("class_names"))
+            plot_confidence_profile(data["results"], coco, data.get("class_names"))
+        else:
+            print("[SKIP] coco_eval.pkl not found")
+PYTHON
+
+# =============================================================================
+# ГЛАВНЫЙ PIPELINE (entrypoint)
+# =============================================================================
+COPY <<'SHELL' /workspace/pipeline.sh
+#!/bin/bash
+set -e
+
+MASTER_LOG=/workspace/logs/00_pipeline.log
+mkdir -p /workspace/logs /workspace/logs/plots
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [PIPELINE] $1" | tee -a $MASTER_LOG
+}
+
+trap 'log "FAILED at step ${CURRENT_STEP} (exit=$?)"; exit 1' ERR
+
+log "=========================================="
+log "YOLOv9 Automated Pipeline START"
+log "=========================================="
+
+if [ -z "${DATASET_CONFIG}" ]; then
+    log "ERROR: DATASET_CONFIG is not set"
+    exit 1
+fi
+
+RUN_NAME=${RUN_NAME:-yolov9-custom}
+TRAINED_WEIGHTS=${TRAINED_WEIGHTS:-/workspace/runs/train/${RUN_NAME}/weights/best.pt}
+ONNX_PATH=${ONNX_PATH:-/workspace/runs/train/${RUN_NAME}/weights/best.onnx}
+TEST_ANNOTATIONS=${TEST_ANNOTATIONS:-/workspace/datasets/test/_annotations.coco.json}
+TEST_IMAGES=${TEST_IMAGES:-/workspace/datasets/test}
+RESULTS_CSV=${RESULTS_CSV:-/workspace/runs/train/${RUN_NAME}/results.csv}
+
+export RUN_NAME TRAINED_WEIGHTS ONNX_PATH TEST_ANNOTATIONS TEST_IMAGES RESULTS_CSV
+
+log "Config: RUN_NAME=$RUN_NAME, EPOCHS=${EPOCHS:-300}, BATCH=${BATCH:-4}, DEVICE=${DEVICE:-0}"
+log "Dataset: $DATASET_CONFIG"
+log "Expected ONNX: $ONNX_PATH"
+log ""
+
+CURRENT_STEP="1/5 TRAIN"
+log "STEP 1/5: Training started > logs/01_train.log"
+START=$(date +%s)
+bash /workspace/01_train.sh
+END=$(date +%s)
+log "STEP 1/5: Training finished in $((END-START))s"
+log "  > Generating training curves..."
+PLOT_MODE=train python /workspace/05_plots.py 2>&1 | tee -a $MASTER_LOG
+log ""
+
+CURRENT_STEP="2/5 TEST PTH"
+log "STEP 2/5: Testing .pth started > logs/02_test_pth.log"
+START=$(date +%s)
+bash /workspace/02_test_pth.sh
+END=$(date +%s)
+log "STEP 2/5: Testing .pth finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="3/5 EXPORT ONNX"
+log "STEP 3/5: Exporting to ONNX started > logs/03_export.log"
+START=$(date +%s)
+bash /workspace/03_export_onnx.sh
+END=$(date +%s)
+log "STEP 3/5: Export finished in $((END-START))s"
+
+if [ ! -f "${ONNX_PATH}" ]; then
+    log "ERROR: ONNX file not found at ${ONNX_PATH}"
+    exit 1
+fi
+log "  ? ONNX created: ${ONNX_PATH}"
+log ""
+
+CURRENT_STEP="4/5 TEST ONNX"
+log "STEP 4/5: Testing .onnx started > logs/04_test_onnx.log"
+START=$(date +%s)
+python /workspace/04_test_onnx.py
+END=$(date +%s)
+log "STEP 4/5: Testing .onnx finished in $((END-START))s"
+log ""
+
+CURRENT_STEP="5/5 PLOTS"
+log "STEP 5/5: Generating PR curves + confusion matrix + confidence profile..."
+START=$(date +%s)
+python /workspace/05_plots.py 2>&1 | tee -a $MASTER_LOG
+END=$(date +%s)
+log "STEP 5/5: Plots finished in $((END-START))s"
+log "  > Plots: /workspace/logs/plots/"
+log ""
+
+log "=========================================="
+log "Pipeline COMPLETE"
+log "Final ONNX: ${ONNX_PATH}"
+log "Logs: /workspace/logs/"
+log "Plots: /workspace/logs/plots/"
+log "=========================================="
+SHELL
+RUN chmod +x /workspace/pipeline.sh
+
+ENTRYPOINT ["/workspace/pipeline.sh"]
