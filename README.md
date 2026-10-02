@@ -124,7 +124,8 @@ Real-time → YOLOv9, MMDetection YOLOX-S.
 Мелкие объекты → Double Head, Detectron2 Faster.
 3D-детекция → MMDetection3D.
 Эксперименты с архитектурой → MMDetection.
-
+```
+```
 📦 my_segmentators — сегментация
 Зачем: классифицировать каждый пиксель (semantic) или различать экземпляры (instance).
 
@@ -144,7 +145,8 @@ Real-time → PIDNet.
 Точность → Mask2Former, SegFormer.
 Медицина → U-Net, MONAI.
 Instance → Mask R-CNN.
-
+```
+```
 📦 my_recognizers — распознавание текста (OCR)
 Зачем: извлечь текст из изображений документов, сканов, чеков.
 
@@ -159,7 +161,8 @@ MMOCR (Apache 2.0) — модульный конструктор (CRNN/SAR/SEG),
 End-to-end документы → LightOnOCR.
 Промышленный OCR с ONNX → PaddleOCR.
 Модульность, CRNN → MMOCR.
-
+```
+```
 📦 my_classification_anomaly_detection — классификация, аномалии, GAN
 Зачем: определить класс объекта, найти аномалии, генерировать изображения.
 
@@ -178,7 +181,8 @@ BigGAN (MIT) — class-conditional GAN, FID 36.94.
 Аномалии production → Anomalib.
 Аномалии кастомизация → PatchCore.
 Class-conditional генерация → BigGAN.
-
+```
+```
 📦 my_tracking_pose_estimation_keypoint_detection — трекинг, pose, keypoints
 Зачем: отслеживать объекты во времени, находить ключевые точки тела/объектов.
 
@@ -198,7 +202,8 @@ Detectron2 Keypoint (Apache 2.0) — keypoint R-CNN (one-class).
 Pose модульность → MMPose.
 Pose real-time → RTMPose.
 Custom keypoints → MMPose Keypoint / Detectron2 Keypoint.
-
+```
+```
 📦 my_depth_estimation_image_restoration_face_recognition_KIELayout_video_understanding — depth, restoration, face, документы, видео, генерация
 Зачем: оценка глубины, восстановление изображений, распознавание лиц, анализ документов, video understanding, генерация.
 
@@ -228,7 +233,8 @@ Face полный пайплайн → UniFace.
 Video → MMAction2, VideoMAE.
 Генерация + скорость → FLUX.2 [klein] 4B.
 Генерация + кастомизация → SDXL.
-
+```
+```
 📦 my_optimization — оптимизация инференса
 Зачем: ускорить ONNX-модели на NVIDIA GPU.
 
