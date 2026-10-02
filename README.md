@@ -35,8 +35,9 @@
 Итого: 41 контейнер.
 
 ## Структура репозитория
-text
-.
+## 📁 Структура проекта
+
+```
 ├── my_detectors/
 │   ├── yolov9_docker.dockerfile
 │   ├── rfdetr_docker.dockerfile
@@ -99,7 +100,8 @@ text
 │   ├── tensorrt_docker.dockerfile
 │   └── README.md
 │
-└── README.md                    # этот файл
+└── README.md                # этот файл
+```
 Что в каждой папке
 📦 my_detectors — детекция объектов
 Зачем: найти объекты на изображении (bbox + класс).
