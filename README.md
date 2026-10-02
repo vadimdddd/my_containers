@@ -393,9 +393,17 @@ docker run -it --rm --gpus all --shm-size=8g \
 ```
 Все 41 контейнер — commercial-clean. Можно использовать в закрытых коммерческих продуктах без раскрытия кода.
 
-Тип лицензии	Модели
-MIT	YOLOv9, ByteTrack, MiDaS, UniFace, RetinaFace, Table Transformer, BigGAN
-Apache 2.0	RF-DETR, D-FINE, MMDetection, MMDetection3D, Detectron2 (все), Double Head, DeepLabV3+, U-Net, SegFormer, PIDNet, Mask2Former, MONAI, LightOnOCR, PaddleOCR, MMOCR, timm, MMPretrain, Anomalib, PatchCore, MMTracking, MMPose, RTMPose, Depth Anything V2, Real-ESRGAN, MMagic, LayoutParser, MMAction2, VideoMAE, FLUX.2 [klein] 4B
-CreativeML Open RAIL++-M	Stable Diffusion XL (коммерчески разрешена с ограничениями)
-NVIDIA SLA	TensorRT (бесплатно, только для NVIDIA GPU)
+|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| Тип лицензии                 |                                                             Модели                                                                       |
+|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| **MIT**                      | YOLOv9, ByteTrack, MiDaS, UniFace, RetinaFace, Table Transformer, BigGAN                                                                 |
+|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| **Apache 2.0**               | RF-DETR, D-FINE, MMDetection, MMDetection3D, Detectron2 (все), Double Head, DeepLabV3+, U-Net, SegFormer, PIDNet, Mask2Former, MONAI,    |
+|                              | LightOnOCR, PaddleOCR, MMOCR, timm, MMPretrain, Anomalib, PatchCore, MMTracking, MMPose, RTMPose, Depth Anything V2, Real-ESRGAN, MMagic,|
+|                              | LayoutParser, MMAction2, VideoMAE, FLUX.2 [klein] 4B                                                                                     |
+|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| **CreativeML Open RAIL++-M** | Stable Diffusion XL (коммерчески разрешена с ограничениями)                                                                              |
+|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| **NVIDIA SLA**               | TensorRT (бесплатно, только для NVIDIA GPU)                                                                                              |
+|------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
 ```
