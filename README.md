@@ -12,15 +12,17 @@
 
 ## Быстрый обзор
 ```
-| Папка | Задача | Контейнеров | Ключевые модели |
-|-------|--------|:-----------:|-----------------|
-| `my_detectors` | Детекция объектов (2D и 3D) | 7 | YOLOv9, RF-DETR, D-FINE,<br>MMDetection, MMDetection3D,<br>Detectron2 Faster, Double Head |
-| `my_segmentators` | Семантическая и instance-сегментация | 7 | DeepLabV3+, U-Net, SegFormer,<br>PIDNet, Mask2Former,<br>Mask R-CNN, MONAI |
-| `my_recognizers` | Распознавание текста (OCR) | 3 | LightOnOCR, PaddleOCR, MMOCR |
-| `my_classification_...` | Классификация, anomaly detection, GAN | 5 | timm, MMPretrain, Anomalib,<br>PatchCore, BigGAN |
-| `my_tracking_pose_...` | Трекинг, pose, keypoints | 6 | ByteTrack, MMTracking, MMPose,<br>RTMPose, MMPose-Keypoint,<br>Detectron2-Keypoint |
-| `my_depth_estimation...` | Depth, restoration, face, документы, видео, генерация | 12 | Depth Anything V2, MiDaS,<br>Real-ESRGAN, MMagic, UniFace,<br>RetinaFace, LayoutParser,<br>Table Transformer, MMAction2,<br>VideoMAE, FLUX.2 [klein] 4B, SDXL |
-| `my_optimization` | Оптимизация инференса | 1 | TensorRT 10.x |
+|            Папка          |                         Задача                      | Контейнеров |                             Ключевые модели                             |
+|---------------------------|-----------------------------------------------------|:-----------:|-------------------------------------------------------------------------|
+| `my_detectors`            | Детекция объектов (2D и 3D)                         |     7       | YOLOv9, RF-DETR, D-FINE, MMDet, MMDet3D, Detectron2 Faster, Double Head |
+| `my_segmentators`         | Семантическая и instance-сегментация                |     7       | DeepLabV3+, U-Net, SegFormer,<br>PIDNet, Mask2Former, Mask R-CNN, MONAI |
+| `my_recognizers`          | Распознавание текста (OCR)                          |     3       | LightOnOCR, PaddleOCR, MMOCR                                            |
+| `my_classification_...`   | Классификация, anomaly detection, GAN               |     5       | timm, MMPretrain, Anomalib, PatchCore, BigGAN                           |
+| `my_tracking_pose_...`    | Трекинг, pose, keypoints                            |     6       | ByteTrack, MMTracking, MMPose, RTMPose, (MMPose, Detectron2)-Keypoint   |
+| `my_depth_estimation...`  | Depth, restoration, face, docs, видео, генерация    |     12      | Depth Anything V2, MiDaS, Real-ESRGAN, MMagic, UniFace, RetinaFace      |
+|                           |                                                     |             | LayoutParser, Table Transformer, MMAction2, VideoMAE, FLUX.2[klein4B]   | |                           |                                                     |             | SDXL                                                                    |
+| `my_optimization`         | Оптимизация инференса                               |     1       | TensorRT 10.x                                                           |
+|---------------------------|-----------------------------------------------------|:-----------:|-------------------------------------------------------------------------|
 ```
 Итого: 41 контейнер.
 
