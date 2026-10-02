@@ -102,35 +102,27 @@
 ```
 
 ## Что в каждой папке
+
 ```
+🎯 my_detectors — детекция объектов (2D и 3D)
 Зачем: найти объекты на изображении (bbox + класс).
 
 Что внутри:
 
 YOLOv9 (MIT) — классика one-stage, знакомая архитектура.
-
 RF-DETR (Apache 2.0) — SOTA one-stage DETR без NMS.
-
 D-FINE (Apache 2.0) — лёгкий one-stage DETR для edge.
-
 MMDetection (Apache 2.0) — модульный конструктор: перебор backbone/neck/head через env.
-
 MMDetection3D (Apache 2.0) — 3D-детекция на LiDAR/monocular/multi-modal.
-
 Detectron2 Faster R-CNN (Apache 2.0) — two-stage с гибким PyTorch-кодом.
-
 Double Head R-CNN (Apache 2.0) — two-stage с раздельными головами (+3.5 AP).
 
 Когда выбирать:
 
 Real-time → YOLOv9, MMDetection YOLOX-S.
-
 Максимальное качество → RF-DETR.
-
 Мелкие объекты → Double Head, Detectron2 Faster.
-
 3D-детекция → MMDetection3D.
-
 Эксперименты с архитектурой → MMDetection.
 
 📦 my_segmentators — сегментация
@@ -139,27 +131,18 @@ Real-time → YOLOv9, MMDetection YOLOX-S.
 Что внутри:
 
 DeepLabV3+ (Apache 2.0) — semantic, чёткиe границы (82.1 mIoU).
-
 U-Net (Apache 2.0) — лёгкий, для малых данных и медицины.
-
 SegFormer (Apache 2.0) — трансформерный semantic.
-
 PIDNet (Apache 2.0) — real-time semantic (93 FPS).
-
 Mask2Former (Apache 2.0) — универсальный (semantic + instance + panoptic).
-
 Detectron2 Mask R-CNN (Apache 2.0) — instance-сегментация.
-
 MONAI (Apache 2.0) — медицинская 3D-сегментация (DICOM/NIfTI).
 
 Когда выбирать:
 
 Real-time → PIDNet.
-
 Точность → Mask2Former, SegFormer.
-
 Медицина → U-Net, MONAI.
-
 Instance → Mask R-CNN.
 
 📦 my_recognizers — распознавание текста (OCR)
@@ -168,17 +151,13 @@ Instance → Mask R-CNN.
 Что внутри:
 
 LightOnOCR-2-1B (Apache 2.0) — end-to-end VLM, SOTA на OlmOCR-Bench.
-
 PaddleOCR (Apache 2.0) — традиционный toolkit (детектор + распознаватель), 80+ языков.
-
 MMOCR (Apache 2.0) — модульный конструктор (CRNN/SAR/SEG), word-level метрики.
 
 Когда выбирать:
 
 End-to-end документы → LightOnOCR.
-
 Промышленный OCR с ONNX → PaddleOCR.
-
 Модульность, CRNN → MMOCR.
 
 📦 my_classification_anomaly_detection — классификация, аномалии, GAN
@@ -187,25 +166,17 @@ End-to-end документы → LightOnOCR.
 Что внутри:
 
 timm (Apache 2.0) — 800+ моделей классификации.
-
 MMPretrain (Apache 2.0) — классификация от OpenMMLab.
-
 Anomalib (Apache 2.0) — anomaly detection, 15+ алгоритмов (PatchCore: 0.980 AUROC).
-
 PatchCore (Apache 2.0) — standalone-реализация PatchCore.
-
 BigGAN (MIT) — class-conditional GAN, FID 36.94.
 
 Когда выбирать:
 
 Классификация быстро → timm.
-
 Классификация OpenMMLab → MMPretrain.
-
 Аномалии production → Anomalib.
-
 Аномалии кастомизация → PatchCore.
-
 Class-conditional генерация → BigGAN.
 
 📦 my_tracking_pose_estimation_keypoint_detection — трекинг, pose, keypoints
@@ -214,27 +185,18 @@ Class-conditional генерация → BigGAN.
 Что внутри:
 
 ByteTrack (MIT) — MOT поверх готовых детекций.
-
 MMTracking (Apache 2.0) — модульный MOT/SOT/VID.
-
 MMPose (Apache 2.0) — pose estimation (body/face/hand/animal).
-
 RTMPose (Apache 2.0) — real-time multi-person pose.
-
 MMPose Keypoint (Apache 2.0) — custom keypoints (multi-class).
-
 Detectron2 Keypoint (Apache 2.0) — keypoint R-CNN (one-class).
 
 Когда выбирать:
 
 Трекинг production → ByteTrack.
-
 Трекинг OpenMMLab → MMTracking.
-
 Pose модульность → MMPose.
-
 Pose real-time → RTMPose.
-
 Custom keypoints → MMPose Keypoint / Detectron2 Keypoint.
 
 📦 my_depth_estimation_image_restoration_face_recognition_KIELayout_video_understanding — depth, restoration, face, документы, видео, генерация
@@ -243,47 +205,28 @@ Custom keypoints → MMPose Keypoint / Detectron2 Keypoint.
 Что внутри:
 
 Depth Anything V2 (Apache 2.0) — SOTA monocular depth.
-
 MiDaS (MIT) — лёгкий depth estimation.
-
 Real-ESRGAN (Apache 2.0) — blind super-resolution.
-
 MMagic (Apache 2.0) — restoration toolkit (ESRGAN, BasicVSR).
-
 UniFace (MIT) — all-in-one face analysis (детекция + распознавание + landmarks).
-
 RetinaFace (MIT) — только детекция лиц.
-
 LayoutParser (Apache 2.0) — документ layout analysis.
-
 Table Transformer (MIT) — detection + structure recognition таблиц.
-
 MMAction2 (Apache 2.0) — video understanding.
-
 VideoMAE (Apache 2.0) — self-supervised видео.
-
 FLUX.2 [klein] 4B (Apache 2.0) — text-to-image + editing, sub-second.
-
 Stable Diffusion XL (CreativeML Open RAIL++-M) — максимальная кастомизация.
 
 Когда выбирать:
 
 Depth SOTA → Depth Anything V2.
-
 Depth легко → MiDaS.
-
 Restoration real-world → Real-ESRGAN.
-
 Face полный пайплайн → UniFace.
-
 Документы layout → LayoutParser.
-
 Таблицы → Table Transformer.
-
 Video → MMAction2, VideoMAE.
-
 Генерация + скорость → FLUX.2 [klein] 4B.
-
 Генерация + кастомизация → SDXL.
 
 📦 my_optimization — оптимизация инференса
@@ -296,9 +239,7 @@ TensorRT 10.x (NVIDIA SLA, бесплатно) — компилятор ONNX в 
 Когда выбирать:
 
 Production deployment ONNX-моделей.
-
 Latency-critical задачи.
-
 FP16/INT8 квантизация.
 ```
 
@@ -307,7 +248,6 @@ FP16/INT8 квантизация.
 GPU и драйверы
 Убедись, что nvidia-container-toolkit установлен и GPU доступен Docker'у:
 
-bash
 docker run --gpus all nvidia/cuda:12.6-base nvidia-smi
 Если команда не выводит таблицу с GPU — внутри контейнера GPU не увидится, и пайплайн упадёт на этапе тренировки.
 
@@ -320,7 +260,6 @@ Shared memory
 
 ## Быстрый старт
 ```
-bash
 # 1. Подготовка директорий
 mkdir -p datasets runs logs work_dirs output
 
@@ -350,22 +289,15 @@ ls ../runs/train/yolov9-mydata/weights/ # best.pt и best.onnx
 Единый пайплайн
 Все контейнеры следуют одной схеме:
 
-text
 convert → train → test .pth → export .onnx → test .onnx → plots
 convert — конвертация LabelMe/COCO/YOLO в формат модели.
-
 train — обучение с параметрами из env.
-
 test .pth — baseline mAP/mIoU на тестовой выборке.
-
 export .onnx — экспорт для production.
-
 test .onnx — проверка, что экспорт не сломал качество.
-
 plots — графики: training curves, PR-curves (AUC-PR), confusion matrix, confidence profile.
 
 Единая структура логов
-text
 logs/
 ├── 00_pipeline.log      # мастер-лог: все шаги с таймстампами и exit code
 ├── 01_train.log         # тренировка
@@ -377,10 +309,11 @@ logs/
     ├── 02_pr_curves.png
     ├── 03_confusion_matrix.png
     └── 04_confidence_profile.png
+
 Первый файл при проблеме — 00_pipeline.log. Там видно, на каком шаге упало и с каким кодом.
 
 Единый запуск
-bash
+
 docker run -it --rm --gpus all --shm-size=8g \
     -v $(pwd)/datasets:/workspace/datasets \
     -v $(pwd)/runs:/workspace/runs \
