@@ -1,0 +1,84 @@
+Шаг 1: Установите драйвер NVIDIA для Windows (с поддержкой WSL2)
+Это самый важный шаг. Вам нужен не просто обычный драйвер, а специальная версия, которая включает поддержку WSL2 GPU Paravirtualization.
+
+Перейдите на сайт NVIDIA и скачайте драйвер для вашей видеокарты: https://www.nvidia.com/drivers.
+
+Важно: Убедитесь, что скачиваете драйвер Game Ready или Studio версии 465.21 или новее (в идеале — самый свежий). Эти драйверы содержат компоненты для работы GPU в WSL2.
+
+Установите драйвер и перезагрузите компьютер.
+
+После перезагрузки откройте PowerShell (от имени администратора) и проверьте, что драйвер установлен, выполнив команду nvidia-smi. Вы должны увидеть таблицу с информацией о вашей GPU.
+
+Шаг 2: Установите и настройте WSL2
+WSL2 — это легковесная виртуальная машина с Linux, которая будет хостом для вашего Docker-контейнера.
+
+В PowerShell (от имени администратора) выполните команду:
+
+```
+wsl --install
+```
+
+Эта команда автоматически включит необходимые компоненты Windows, установит ядро Linux и дистрибутив Ubuntu по умолчанию.
+
+После завершения установки перезагрузите компьютер.
+
+После перезагрузки система может попросить вас создать имя пользователя и пароль для Ubuntu. Следуйте инструкциям на экране.
+
+Убедитесь, что WSL2 используется по умолчанию. В PowerShell выполните:
+
+```
+wsl --status
+```
+
+В выводе должно быть указано Default Version: 2.
+
+Шаг 3: Установите Docker Desktop
+Скачайте и установите Docker Desktop для Windows с официального сайта: https://www.docker.com/products/docker-desktop.
+
+Во время установки убедитесь, что стоит галочка "Use WSL 2 instead of Hyper-V" (Использовать WSL 2 вместо Hyper-V).
+
+После установки запустите Docker Desktop. Перейдите в Settings (Настройки):
+
+В разделе General (Общие) убедитесь, что галочка "Use the WSL 2 based engine" (Использовать движок на основе WSL 2) включена.
+
+В разделе Resources > WSL Integration (Ресурсы > Интеграция с WSL) включите интеграцию с вашим установленным дистрибутивом Ubuntu.
+
+Нажмите "Apply & Restart".
+
+Шаг 4: Установите NVIDIA Container Toolkit (внутри WSL2)
+Этот компонент — «мост», который позволяет Docker внутри WSL2 видеть GPU.
+
+Откройте терминал Ubuntu (его можно найти в меню «Пуск»). Все следующие команды выполняются именно в этом терминале, а не в PowerShell.
+
+Добавьте репозиторий NVIDIA и установите toolkit. Выполните эти команды по одной:
+
+```
+# Добавляем GPG-ключ и репозиторий
+curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg
+echo "deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://nvidia.github.io/libnvidia-container/stable/deb/\$(ARCH) /" | sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
+
+# Обновляем список пакетов и устанавливаем toolkit
+sudo apt-get update
+sudo apt-get install -y nvidia-container-toolkit
+```
+
+Настройте Docker на использование NVIDIA runtime:
+
+```
+sudo nvidia-ctk runtime configure --runtime=docker
+```
+
+Важно: После этой команды перезапустите Docker Desktop, щелкнув правой кнопкой мыши по его значку в системном трее и выбрав "Restart" (Перезапустить).
+
+Шаг 5: Проверьте, что GPU доступен Docker'у
+Теперь выполните ту же проверочную команду, что и в README.md, но в терминале Ubuntu (WSL2):
+
+```
+docker run --rm --gpus all nvidia/cuda:12.6-base nvidia-smi
+```
+
+Если вы увидели таблицу nvidia-smi — всё готово! Ваша Windows-система настроена, и можно переходить к сборке образов и запуску обучения.
+
+Если команда падает с ошибкой — проверьте, что Docker Desktop перезапущен, а в его настройках включен WSL2 бэкенд и интеграция с вашим дистрибутивом Ubuntu.
+
+После выполнения этих шагов ваш ПК на Windows будет полностью готов к работе с пайплайнами из README.md.
